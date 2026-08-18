@@ -14,7 +14,7 @@ This repository turns the original two-node recipe into a reproducible, long-age
 - **Head/Worker containers exit during distributed startup**: the scripts enforce unique ranks, Worker-first startup, dual-HCA RoCE, matching IP/MTU checks, and dynamic IPv4 GID selection instead of a fragile hard-coded GID index.
 - **Setup assumes the operator is root**: `prepare.sh` now runs as an ordinary user and requests targeted `sudo` only for the protected model directory and RoCE configuration; it no longer recursively changes ownership of all `/data`.
 - **A configured 1M limit is mistaken for proven capacity**: the stable profile uses FP8 KV, chunked prefill, prefix caching, `MAX_NUM_SEQS=6`, and synchronous scheduling. It has passed a `999,860`-token single request and six concurrent `79,134`-token shared-prefix requests; six active sequences do not mean 6 × 1M KV capacity.
-- **Client and cluster addresses are confused**: OpenAI-compatible clients use the Head management/LAN endpoint, while the example `10.10.12.0/24` and `10.10.13.0/24` networks remain dedicated to Head/Worker RoCE traffic.
+- **Client and cluster addresses are confused**: OpenAI-compatible and Anthropic-compatible clients use the Head management/LAN endpoint, while the example `10.10.12.0/24` and `10.10.13.0/24` networks remain dedicated to Head/Worker RoCE traffic.
 
 In short: it fixes both sides of long-session protocol failure (history encoding and tool-output parsing), makes dual-node startup repeatable, removes root-only setup assumptions, and records a tested stability baseline instead of relying only on advertised configuration values.
 
@@ -36,7 +36,7 @@ In short: it fixes both sides of long-session protocol failure (history encoding
 - **TP=2** across 2 GB10 GPUs (1 per node), **PP=1**, **NNODES=2**
 - **Network**: two RoCE v2 paths, dynamic GID selection, MTU 9000
 - **Runtime**: FP8 KV, 1M model limit, DSpark speculative decoding
-- **Clients**: use the Head management/LAN address, not the RoCE data-plane address
+- **Clients**: use the Head management/LAN or Tailscale address, not the RoCE data-plane address
 
 ---
 
@@ -169,7 +169,46 @@ curl -s http://${API_HOST}:8888/v1/chat/completions \
   }'
 ```
 
-#### 5.4 Throughput Benchmark
+#### 5.4 Claude Code — Native Anthropic API
+
+The bundled vLLM runtime exposes native Anthropic-compatible
+`/v1/messages` and `/v1/messages/count_tokens` endpoints. Claude Code can
+therefore connect directly to the Head; an Anthropic-to-OpenAI conversion proxy
+is not required.
+
+```bash
+API_HOST=head-management-hostname-or-tailscale-name
+export ANTHROPIC_BASE_URL="http://${API_HOST}:8888"
+export ANTHROPIC_API_KEY=dummy
+
+claude --model 'deepseek-v4-flash[1m]'
+```
+
+- Keep `ANTHROPIC_BASE_URL` at the server root; do **not** append `/v1` because
+  Claude Code adds `/v1/messages` itself.
+- The tested `[1m]` suffix tells Claude Code to manage this custom model as a
+  1M-context model. Without it, Claude Code may assign an unknown model a
+  smaller default context window even though vLLM accepts 1M tokens.
+- Use the Head management/LAN hostname or a private-overlay hostname such as
+  Tailscale. Do not use the dedicated Head/Worker RoCE addresses.
+- `dummy` is suitable only when vLLM was started without API-key enforcement and
+  network access is already trusted. If `--api-key` is configured, use that key.
+
+Confirm the native Anthropic endpoint independently:
+
+```bash
+curl -s "${ANTHROPIC_BASE_URL}/v1/messages" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "deepseek-v4-flash",
+    "max_tokens": 32,
+    "messages": [{"role": "user", "content": "Reply only OK."}]
+  }' | python3 -m json.tool
+```
+
+#### 5.5 Throughput Benchmark
 
 ```bash
 # Single request latency
@@ -199,7 +238,7 @@ Expected benchmarks (TP=2 dual-node):
 | Throughput (single 500-token request) | **40-60 tok/s** |
 | End-to-end latency (500 tokens) | ~10-15s |
 
-#### 5.5 Verify NCCL Communication
+#### 5.6 Verify NCCL Communication
 
 ```bash
 docker logs vllm_anemll 2>&1 | grep -E "NCCL.*comm|NCCL.*rank|NCCL.*Channel"
@@ -208,7 +247,7 @@ docker logs vllm_anemll 2>&1 | grep -E "NCCL.*comm|NCCL.*rank|NCCL.*Channel"
 
 > If only `rank 0 nranks 1` appears, Worker failed to join — check Worker logs and RoCE connectivity.
 
-#### 5.6 Monitoring Quick Reference
+#### 5.7 Monitoring Quick Reference
 
 ```bash
 docker exec vllm_anemll nvidia-smi           # GPU utilization
@@ -217,12 +256,13 @@ docker stats vllm_anemll                      # Container resource usage
 docker logs vllm_anemll 2>&1 | grep -i "worker\|node_rank.*1"  # Worker status
 ```
 
-#### 5.7 Common Verification Failures
+#### 5.8 Common Verification Failures
 
 | Symptom | Cause | Solution |
 |---------|-------|----------|
 | `curl` no response | Head still loading | Wait 5-10 min, check for `Ulysses model is ready` in logs |
 | `model not found` | Wrong served-model-name | Use `deepseek-v4-flash` |
+| Claude Code reports a smaller context | Custom model uses Claude Code's fallback metadata | Launch with `--model 'deepseek-v4-flash[1m]'` |
 | Garbled output | tokenizer not loaded | Check `--tokenizer-mode deepseek_v4` |
 | Very low speed (<10 tok/s) | Worker offline or NCCL degraded | Check Worker logs + RoCE |
 | `context length exceeds` | Input exceeds limit | Default 1M context, check input size |
@@ -446,7 +486,7 @@ MIT
 - **TP=2** 跨两块 GB10 GPU（每节点 1 块），**PP=1**，**NNODES=2**
 - **网络**：两条 RoCE v2 路径，动态 GID，MTU 9000
 - **运行时**：FP8 KV、1M 上限、DSpark speculative decoding
-- **客户端**：使用 Head 管理网/LAN 地址，不使用 RoCE 数据面地址
+- **客户端**：使用 Head 管理网/LAN 或 Tailscale 地址，不使用 RoCE 数据面地址
 
 ---
 
@@ -571,7 +611,45 @@ curl -s http://${API_HOST}:8888/v1/chat/completions \
   }'
 ```
 
-#### 5.4 吞吐基准
+#### 5.4 Claude Code——原生 Anthropic API
+
+当前稳定运行时原生提供 `/v1/messages` 和
+`/v1/messages/count_tokens`。Claude Code 可以直接连接 Head，不需要再经过
+Anthropic → OpenAI 协议转换代理：
+
+```bash
+API_HOST=head-management-hostname-or-tailscale-name
+export ANTHROPIC_BASE_URL="http://${API_HOST}:8888"
+export ANTHROPIC_API_KEY=dummy
+
+claude --model 'deepseek-v4-flash[1m]'
+```
+
+- `ANTHROPIC_BASE_URL` 只写到端口，不要追加 `/v1`；Claude Code 会自行请求
+  `/v1/messages`。
+- 经验证，`[1m]` 后缀会让 Claude Code 按 1M 上下文管理这个自定义模型；
+  不加时，客户端可能按未知模型的较小默认窗口处理，即使 vLLM 后端已经配置
+  `--max-model-len 1048576`。
+- `API_HOST` 应使用 Head 的管理网/LAN 主机名，或 Tailscale 等私有覆盖网络的
+  主机名；不要使用双机 RoCE 数据面地址。
+- 只有在 vLLM 未启用 API Key 且网络访问已经受信时才能使用 `dummy`。如果启动
+  vLLM 时配置了 `--api-key`，这里必须填写对应密钥。
+
+可以先独立验证原生 Anthropic 接口：
+
+```bash
+curl -s "${ANTHROPIC_BASE_URL}/v1/messages" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "deepseek-v4-flash",
+    "max_tokens": 32,
+    "messages": [{"role": "user", "content": "Reply only OK."}]
+  }' | python3 -m json.tool
+```
+
+#### 5.5 吞吐基准
 
 ```bash
 # 单请求延迟
@@ -587,14 +665,14 @@ curl -s -o /dev/null -w "TTFT: %{time_starttransfer}s | Total: %{time_total}s\n"
 
 参考值：TTFT ~1s，吞吐 40-60 tok/s（500 token 输出）。
 
-#### 5.5 验证 NCCL
+#### 5.6 验证 NCCL
 
 ```bash
 docker logs vllm_anemll 2>&1 | grep -E "NCCL.*comm|NCCL.*rank|NCCL.*Channel"
 # 预期：rank 0 nranks 2（两节点连接成功）
 ```
 
-#### 5.6 监控速查
+#### 5.7 监控速查
 
 ```bash
 docker exec vllm_anemll nvidia-smi           # GPU 使用率
@@ -603,12 +681,13 @@ docker stats vllm_anemll                      # 容器资源占用
 docker logs vllm_anemll 2>&1 | grep -i "worker\|node_rank.*1"  # Worker 在线状态
 ```
 
-#### 5.7 常见验证失败
+#### 5.8 常见验证失败
 
 | 现象 | 原因 | 排查 |
 |------|------|------|
 | `curl` 无响应 | Head 尚未加载完 | 等 5-10 分钟，看日志是否出现 `Ulysses model is ready` |
 | `model not found` | 模型名不匹配 | 使用 `deepseek-v4-flash` |
+| Claude Code 显示较小上下文 | 自定义模型使用了客户端默认元数据 | 使用 `--model 'deepseek-v4-flash[1m]'` 启动 |
 | 乱码/空白 | tokenizer 未加载 | 检查 `--tokenizer-mode deepseek_v4` |
 | 速度 <10 tok/s | Worker 离线或 NCCL 降级 | 检查 Worker 日志 + RoCE |
 | `context length exceeds` | 输入超限 | 默认 1M context，检查输入长度 |

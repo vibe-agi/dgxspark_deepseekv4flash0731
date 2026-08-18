@@ -191,7 +191,47 @@ curl -s http://${API_HOST}:8888/v1/chat/completions \
   }'
 ```
 
-#### ⑤ 吞吐基准
+#### ⑤ Claude Code（vLLM 原生 Anthropic API）
+
+当前稳定运行时原生提供 `/v1/messages` 和
+`/v1/messages/count_tokens`，Claude Code 可以直接连接 Head，不需要再通过
+Anthropic → OpenAI 协议转换代理：
+
+```bash
+API_HOST=head-management-hostname-or-tailscale-name
+export ANTHROPIC_BASE_URL="http://${API_HOST}:8888"
+export ANTHROPIC_API_KEY=dummy
+
+claude --model 'deepseek-v4-flash[1m]'
+```
+
+注意：
+
+- `ANTHROPIC_BASE_URL` 只写到端口，不要追加 `/v1`；Claude Code 会自行请求
+  `/v1/messages`。
+- 经验证，`[1m]` 后缀会让 Claude Code 按 1M 上下文管理这个自定义模型；
+  不加时，客户端可能按未知模型的较小默认窗口处理，即使 vLLM 后端已经配置
+  `--max-model-len 1048576`。
+- `API_HOST` 应使用 Head 的管理网/LAN 主机名，或 Tailscale 等私有覆盖网络的
+  主机名；不要使用双机 RoCE 数据面地址。
+- 只有在 vLLM 未启用 API Key 且网络访问已经受信时才能使用 `dummy`。如果启动
+  vLLM 时配置了 `--api-key`，这里必须填写对应密钥。
+
+可以先独立验证原生 Anthropic 接口：
+
+```bash
+curl -s "${ANTHROPIC_BASE_URL}/v1/messages" \
+  -H "Content-Type: application/json" \
+  -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "deepseek-v4-flash",
+    "max_tokens": 32,
+    "messages": [{"role": "user", "content": "Reply only OK."}]
+  }' | python3 -m json.tool
+```
+
+#### ⑥ 吞吐基准
 
 ```bash
 # 单请求延迟
@@ -207,7 +247,7 @@ curl -s -o /dev/null -w "TTFT: %{time_starttransfer}s | Total: %{time_total}s\n"
 
 参考值：TTFT ~1s，吞吐 40-60 tok/s（500 token 输出）。
 
-#### ⑥ 验证 NCCL 跨节点通信
+#### ⑦ 验证 NCCL 跨节点通信
 
 ```bash
 docker logs vllm_anemll 2>&1 | grep -E "NCCL.*rank.*nranks"
@@ -220,6 +260,7 @@ docker logs vllm_anemll 2>&1 | grep -E "NCCL.*rank.*nranks"
 |------|------|
 | Connection refused | Head 未加载完，等 5-10 分钟 |
 | model not found | 模型名是 `deepseek-v4-flash` |
+| Claude Code 显示较小上下文 | 使用 `--model 'deepseek-v4-flash[1m]'` 启动 |
 | 速度 < 10 tok/s | Worker 离线，`docker logs` 查 Worker |
 | 乱码/空白 | tokenizer 不正确 |
 
