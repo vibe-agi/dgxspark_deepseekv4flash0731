@@ -4,10 +4,10 @@ set -euo pipefail
 
 # 配置双节点 RoCE 网络（Head + Worker）
 # 用法：./setup-roce.sh [WORKER_SSH]
-# 默认 Worker：root@192.168.22.161
+# 默认 Worker：worker.example（使用当前 SSH 用户/配置）
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORKER_SSH="${1:-root@192.168.22.161}"
+WORKER_SSH="${1:-worker.example}"
 WORKER_PASS="${WORKER_PASS:-YOUR_WORKER_PASSWORD}"
 
 HEAD_ROCE_IP="${HEAD_ROCE_IP:-10.10.12.11}"

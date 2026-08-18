@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 set -euo pipefail
 
-# Start the vLLM Head node on spark-3e35.
+# Start the vLLM Head node on head.example.
 # This script is meant to be run directly on the head node.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

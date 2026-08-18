@@ -5,8 +5,8 @@
 ## 快速开始
 
 1. **编辑环境变量**（必须按你的实际网络/模型路径修改）：
-   - `head.env` —— Head 节点（spark-3e35）
-   - `worker.env` —— Worker 节点（spark-cefb）
+   - `head.env` —— Head 节点（head.example）
+   - `worker.env` —— Worker 节点（worker.example）
 
 2. **（推荐）先跑一遍预检**：
    ```bash

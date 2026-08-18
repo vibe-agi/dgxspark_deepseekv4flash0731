@@ -7,7 +7,7 @@ set -uo pipefail
 # --auto-fix：如果 RoCE 口缺少 IP，自动调用 setup-roce.sh 配置
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORKER_SSH="${1:-root@192.168.22.161}"
+WORKER_SSH="${1:-worker.example}"
 AUTO_FIX=0
 shift 2>/dev/null || true
 

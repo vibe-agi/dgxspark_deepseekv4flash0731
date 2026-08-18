@@ -5,7 +5,7 @@ set -euo pipefail
 # Stop and clean up vLLM containers on both nodes.
 # Usage: ./stop.sh [WORKER_SSH]
 
-WORKER_SSH="${1:-root@192.168.22.161}"
+WORKER_SSH="${1:-worker.example}"
 WORKER_PASS="${WORKER_PASS:-YOUR_WORKER_PASSWORD}"
 
 echo "=== Stopping worker container ==="

@@ -28,19 +28,33 @@ if ! docker image inspect "$IMAGE" &>/dev/null; then
 fi
 echo "✅ Docker 镜像: $IMAGE"
 
-# --- 2. 检测 NCCL_IB_GID_INDEX ---
-if ip link show "$NCCL_INTF" &>/dev/null; then
-    MTU=$(ip link show "$NCCL_INTF" | grep -oP 'mtu \K[0-9]+')
-    if [ "$MTU" = "9000" ]; then
-        GID_INDEX=5      # RoCE v2 over jumbo frames
-    else
-        GID_INDEX=3      # RoCE v1
+# --- 2. 验证双路 RoCE 网络 ---
+validate_roce_interface() {
+    local intf="$1"
+    local expected_ip="$2"
+
+    if ! ip link show "$intf" &>/dev/null; then
+        echo "❌ RoCE 网卡 $intf 不存在，请修改 config.sh"
+        exit 1
     fi
-    echo "✅ RoCE 网卡: $NCCL_INTF (MTU=$MTU → GID_INDEX=$GID_INDEX)"
-else
-    echo "❌ RoCE 网卡 $NCCL_INTF 不存在，请修改 config.sh 中的 NCCL_INTF"
-    exit 1
-fi
+
+    local mtu local_ip
+    mtu=$(ip link show "$intf" | grep -oP 'mtu \K[0-9]+')
+    local_ip=$(ip -o -4 addr show "$intf" | awk '{print $4}' | cut -d/ -f1 | head -1)
+    if [ "$local_ip" != "$expected_ip" ]; then
+        echo "❌ Head RoCE IP 不匹配: $intf 期望 $expected_ip，实际 ${local_ip:-未配置}"
+        exit 1
+    fi
+    if [ "$mtu" != "9000" ]; then
+        echo "❌ Head RoCE MTU 不匹配: $intf 期望 9000，实际 $mtu"
+        exit 1
+    fi
+    echo "✅ RoCE 网卡: $intf (IP=$local_ip, MTU=$mtu)"
+}
+
+validate_roce_interface "$NCCL_INTF" "$HEAD_IP"
+validate_roce_interface "$NCCL_INTF_SECONDARY" "$HEAD_IP_SECONDARY"
+echo "✅ NCCL 双 HCA: $NCCL_IB_HCAS（地址范围: $ROCE_SUBNET）"
 
 # --- 3. 创建缓存目录 ---
 mkdir -p "$HF_CACHE" "$TMP_DIR"
@@ -56,8 +70,9 @@ fi
 
 # --- 5. 启动 Head 容器 ---
 echo "🚀 启动 DeepSeek V4 Flash Head 节点..."
-echo "   NCCL IB GID_INDEX=$GID_INDEX"
+echo "   NCCL: dual HCA, dynamic GID (AF_INET, RoCE v2, $ROCE_SUBNET)"
 echo "   TP=$TP_SIZE  PP=$PP_SIZE  NUM_SEQS=$MAX_NUM_SEQS"
+echo "   KV=$KV_CACHE_DTYPE  DSpark k=$MTP_NUM_TOKENS"
 echo "   API 端口: $PORT"
 echo ""
 
@@ -77,8 +92,8 @@ docker run -d --name vllm_anemll \
     -e VLLM_HOST_IP="$HEAD_IP" \
     -e MAX_MODEL_LEN="$MAX_MODEL_LEN" \
     -e MAX_NUM_SEQS="$MAX_NUM_SEQS" \
-    -e NCCL_IB_GID_INDEX="$GID_INDEX" \
-    -e NCCL_IB_HCA="rocep1s0f0" \
+    -e NCCL_IB_HCA="$NCCL_IB_HCAS" \
+    -e NCCL_IB_MERGE_NICS=1 \
     -e NCCL_NET=IB \
     -e NCCL_IB_ROCE_VERSION_NUM=2 \
     -e NCCL_CROSS_NIC=1 \
@@ -87,6 +102,7 @@ docker run -d --name vllm_anemll \
     -e NCCL_IGNORE_CPU_AFFINITY=1 \
     -e NCCL_DEBUG=WARN \
     -e NCCL_IB_ADDR_FAMILY=AF_INET \
+    -e NCCL_IB_ADDR_RANGE="$ROCE_SUBNET" \
     -e NCCL_SOCKET_IFNAME="$NCCL_INTF" \
     -e GLOO_SOCKET_IFNAME="$NCCL_INTF" \
     -e TP_SOCKET_IFNAME="$NCCL_INTF" \
@@ -117,21 +133,21 @@ docker run -d --name vllm_anemll \
     "$MODEL_MOUNT" \
         --served-model-name "$SERVED_NAME" \
         --host 0.0.0.0 \
-        --port $PORT \
+        --port "$PORT" \
         --trust-remote-code \
-        --tensor-parallel-size $TP_SIZE \
-        --pipeline-parallel-size $PP_SIZE \
-        --kv-cache-dtype nvfp4_ds_mla \
-        --block-size $BLOCK_SIZE \
-        --max-model-len $MAX_MODEL_LEN \
-        --max-num-seqs $MAX_NUM_SEQS \
-        --max-num-batched-tokens $MAX_BATCHED_TOKENS \
-        --max-cudagraph-capture-size $MAX_CUDAGRAPH \
-        --gpu-memory-utilization $GPU_MEM \
+        --tensor-parallel-size "$TP_SIZE" \
+        --pipeline-parallel-size "$PP_SIZE" \
+        --kv-cache-dtype "$KV_CACHE_DTYPE" \
+        --block-size "$BLOCK_SIZE" \
+        --max-model-len "$MAX_MODEL_LEN" \
+        --max-num-seqs "$MAX_NUM_SEQS" \
+        --max-num-batched-tokens "$MAX_BATCHED_TOKENS" \
+        --max-cudagraph-capture-size "$MAX_CUDAGRAPH" \
+        --gpu-memory-utilization "$GPU_MEM" \
         --enable-prefix-caching \
-        --async-scheduling \
+        --no-async-scheduling \
         --enable-chunked-prefill \
-        --speculative-config '{"method":"dspark","num_speculative_tokens":5,"draft_sample_method":"probabilistic"}' \
+        --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":$MTP_NUM_TOKENS,\"draft_sample_method\":\"probabilistic\"}" \
         --tokenizer-mode deepseek_v4 \
         --distributed-executor-backend mp \
         --moe-backend flashinfer_b12x \

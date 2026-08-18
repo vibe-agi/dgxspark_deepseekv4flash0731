@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: MIT
 set -euo pipefail
 
-# Start the vLLM Worker node on spark-cefb.
+# Start the vLLM Worker node on worker.example.
 # This script is meant to be run directly on the worker node.
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

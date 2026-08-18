@@ -126,7 +126,7 @@ Head 上有 `10.10.12.11/24`，但 Worker 没有 `10.10.12.21/24`，两机 RoCE 
 `preflight.sh` 也支持 `--auto-fix` 参数：
 
 ```bash
-./preflight.sh root@192.168.22.161 --auto-fix
+./preflight.sh worker.example --auto-fix
 ```
 
 ### 验证
@@ -237,7 +237,7 @@ sudo pkill -9 -f "vllm serve" 2>/dev/null || true
 
 ```bash
 cd /root/dsv4dspark
-./start-all.sh root@192.168.22.161
+./start-all.sh worker.example
 # ... 约 5 分 30 秒后 ...
 # ✅ API ready after ~330s
 ```

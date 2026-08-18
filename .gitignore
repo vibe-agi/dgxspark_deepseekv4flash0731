@@ -1,0 +1,12 @@
+# Machine-local deployment overrides and generated state
+deploy/config.local.sh
+deploy/.venv/
+deploy/.backups/
+deploy/*.bak-*
+deploy/stability-results/
+
+# Runtime noise
+*.log
+__pycache__/
+*.pyc
+.DS_Store

@@ -15,6 +15,7 @@
 7. [容器卡在 NCCL init / 死锁](#7-容器卡在-nccl-init--死锁)
 8. [启动顺序问题](#8-启动顺序问题)
 9. [Worker 必须从 docker run 启动](#9-worker-必须从-docker-run-启动)
+10. [长 Agent 会话逐渐乱码](#10-长-agent-会话逐渐乱码)
 
 ---
 
@@ -29,7 +30,7 @@ NCCL WARN NET/IB : mlx5_0:1 got error from peer
 ### 根因
 1. **RoCE IP 未配** — `enp1s0f0np0` 接口无 IP 地址
 2. **MTU 不匹配** — 默认 1500，RoCE 需要 9000
-3. **GID_INDEX 错误** — MTU 1500 时 NCCL 自动选 GID=5 但实际在 GID=3 的路由表里
+3. **固定 GID 索引错误** — 两台机的 GID 表位置不一致，同一个索引在某个节点不是所需的 IPv4/RoCE-v2 GID
 
 ### 解决
 ```bash
@@ -43,13 +44,7 @@ ibv_devinfo | grep -A5 mlx5_0
 ping 10.10.12.21   # 从 Head ping Worker
 ```
 
-### 备用方案（如果 MTU 9000 失败）
-如果 MTU 9000 无法工作（交换机不支持/环境限制），降到 MTU 1500：
-
-```bash
-ip link set enp1s0f0np0 mtu 1500
-export NCCL_IB_GID_INDEX=3
-```
+生产脚本不再设置 `NCCL_IB_GID_INDEX`，而是使用 `NCCL_IB_ADDR_FAMILY=AF_INET` 和数据面地址范围让 NCCL 动态选择。MTU 应在两端保持一致；它不能用来推导 GID 表索引。
 
 ---
 
@@ -151,10 +146,13 @@ iptables -t nat -A POSTROUTING -p tcp -d $CONTAINER_IP --dport 8080 -j MASQUERAD
 NetworkManager 覆盖了手动配置。
 
 ### 解决
+
+让部署脚本通过 NetworkManager 创建带 IP、MTU 9000、`never-default` 和开机自启的持久连接：
+
 ```bash
-nmcli dev set enp1s0f0np0 managed no
+bash prepare.sh --roce head      # Head
+bash prepare.sh --roce worker    # Worker
 ```
-然后写 Netplan 或其他持久化配置。
 
 ---
 
@@ -202,3 +200,33 @@ Worker 先启动约 10-30 秒后 Head 再启动即可。
 
 ### 解决
 Worker 必须独立 `docker run` 一个新的 vLLM 容器，不能用 `docker exec` 或 docker-compose 的 `exec`。
+
+---
+
+## 10. 长 Agent 会话逐渐乱码
+
+### 现象
+
+短对话正常，但经过多轮 reasoning/tool call 之后出现重复操作、虚构的 system reminder，或泄露 `<antml:...>`、`<｜DSML｜...>` 等协议标签。问题往往在客户端显示上下文只使用 20%–30% 时就出现。
+
+### 根因
+
+Agent 网关可能将一个 assistant turn 重放为相邻的文本、reasoning 和 tool-call 记录。固定 Anemll `0.1.1` 镜像中的 DeepSeek-V4 tokenizer 早于 vLLM PR #50686，会分别渲染这些相邻 assistant 记录，长时间积累后产生错误 reasoning/EOS 边界。这不是“1M KV cache 已经用完”。
+
+### 解决
+
+1. 在两台节点构建并使用 `stable-runtime/` 薄层镜像；它只应用 PR #50686 tokenizer 补丁，不修改模型权重。
+2. 使用 FP8 KV、prefix caching、chunked prefill、`MAX_NUM_SEQS=6` 和 `--no-async-scheduling`。
+3. 运行协议回归：
+
+```bash
+./stability-probe.py \
+  --base-url http://127.0.0.1:8888 \
+  --rounds 32 \
+  --filler-repetitions 800 \
+  --repeat 1 \
+  --concurrency 6 \
+  --timeout 1800
+```
+
+已验证的双 Spark 基线中，6 路请求每路为 `79,134` prompt tokens，全部返回精确标记，无协议标签泄露。若只有真实业务会话仍失败，将该请求形状脱敏后加入回归；不要仅在网关层逐个替换特殊标签。

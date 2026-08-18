@@ -3,11 +3,11 @@
 set -euo pipefail
 
 # Orchestrate the two-node vLLM deployment from the head node.
-# Defaults are for: head=spark-3e35, worker=spark-cefb (192.168.22.161)
+# Generic defaults: head=head.example, worker=worker.example
 # Usage: ./start-all.sh [WORKER_SSH]
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-WORKER_SSH="${1:-root@192.168.22.161}"
+WORKER_SSH="${1:-worker.example}"
 WORKER_PASS="${WORKER_PASS:-YOUR_WORKER_PASSWORD}"
 HEAD_START_SCRIPT="${SCRIPT_DIR}/start-head.sh"
 WORKER_START_SCRIPT="${SCRIPT_DIR}/start-worker.sh"
