@@ -14,7 +14,14 @@ from typing import Any
 
 BANNED_OUTPUT = (
     "<antml:",
+    "</antml:",
     "<｜DSML｜",
+    "<|DSML|",
+    "</parameter>",
+    "</invoke>",
+    "</tool_calls>",
+    "<tool_call",
+    "</tool_call",
     "<think>",
     "</think>",
 )
@@ -37,12 +44,16 @@ def post_json(base_url: str, path: str, payload: dict[str, Any], timeout: int):
     return body, time.monotonic() - started
 
 
-def clean_text(text: str, marker: str) -> None:
-    if marker not in text:
-        raise AssertionError(f"missing marker {marker!r}: {text[:500]!r}")
+def assert_no_protocol_markup(text: str) -> None:
     leaked = [token for token in BANNED_OUTPUT if token in text]
     if leaked:
         raise AssertionError(f"protocol markup leaked: {leaked}: {text[:500]!r}")
+
+
+def clean_text(text: str, marker: str) -> None:
+    if marker not in text:
+        raise AssertionError(f"missing marker {marker!r}: {text[:500]!r}")
+    assert_no_protocol_markup(text)
 
 
 def build_split_history(rounds: int, filler_repetitions: int, marker: str):
@@ -123,6 +134,67 @@ def main() -> None:
                 "elapsed_seconds": round(elapsed, 3),
                 "input_tokens": response["usage"]["input_tokens"],
                 "output": response_text,
+            },
+            ensure_ascii=False,
+        )
+    )
+
+    tool_payload = {
+        "model": args.model,
+        "messages": [
+            {
+                "role": "user",
+                "content": (
+                    "Call protocol_probe with message exactly structured-tool-ok. "
+                    "Do not write prose."
+                ),
+            }
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "function": {
+                    "name": "protocol_probe",
+                    "description": "Return a protocol parser probe.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"message": {"type": "string"}},
+                        "required": ["message"],
+                        "additionalProperties": False,
+                    },
+                },
+            }
+        ],
+        "tool_choice": {
+            "type": "function",
+            "function": {"name": "protocol_probe"},
+        },
+        "max_tokens": 128,
+        "temperature": 0,
+    }
+    tool_response, tool_elapsed = post_json(
+        args.base_url, "/v1/chat/completions", tool_payload, args.timeout
+    )
+    tool_message = tool_response["choices"][0]["message"]
+    tool_content = tool_message.get("content") or ""
+    assert_no_protocol_markup(tool_content)
+    tool_calls = tool_message.get("tool_calls") or []
+    if len(tool_calls) != 1:
+        raise AssertionError(f"expected one structured tool call: {tool_message!r}")
+    function = tool_calls[0].get("function") or {}
+    arguments = json.loads(function.get("arguments") or "{}")
+    if function.get("name") != "protocol_probe" or arguments != {
+        "message": "structured-tool-ok"
+    }:
+        raise AssertionError(f"unexpected structured tool call: {tool_calls[0]!r}")
+    print(
+        json.dumps(
+            {
+                "case": "structured_tool_call",
+                "elapsed_seconds": round(tool_elapsed, 3),
+                "prompt_tokens": tool_response["usage"]["prompt_tokens"],
+                "tool_name": function["name"],
+                "arguments": arguments,
             },
             ensure_ascii=False,
         )

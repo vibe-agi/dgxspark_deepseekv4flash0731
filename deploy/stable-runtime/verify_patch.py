@@ -1,6 +1,9 @@
 from vllm.tokenizers.deepseek_v4_encoding import (
     merge_consecutive_assistant_messages,
 )
+from vllm.parser.deepseek_v4 import _dsml_arg_converter, deepseek_v4_config
+from vllm.parser.engine.events import EventType
+from vllm.parser.engine.streaming_parser_engine import StreamingParserEngine
 
 
 messages = [
@@ -22,3 +25,35 @@ assert assistant["content"] == "I will check."
 assert assistant["reasoning"] == "Need a tool."
 assert assistant["tool_calls"] == [{"id": "call_1", "type": "function"}]
 assert assistant["wo_eos"] is True
+
+
+def parse_types(text: str) -> list[EventType]:
+    engine = StreamingParserEngine(deepseek_v4_config(False), None)
+    return [event.type for event in engine.parse_complete(text)]
+
+
+ascii_dsml = (
+    '<|DSML|tool_calls><|DSML|invoke name="Bash">'
+    '<|DSML|parameter name="command" string="true">git status'
+    '</|DSML|parameter></|DSML|invoke></|DSML|tool_calls>'
+)
+bare_close_dsml = (
+    '<｜DSML｜tool_calls><｜DSML｜invoke name="Bash">'
+    '<｜DSML｜parameter name="command" string="true">git status'
+    '</parameter></invoke></tool_calls>'
+)
+
+for sample in (ascii_dsml, bare_close_dsml):
+    event_types = parse_types(sample)
+    assert EventType.TOOL_CALL_START in event_types
+    assert EventType.TOOL_CALL_END in event_types
+    assert EventType.TEXT_CHUNK not in event_types
+
+assert _dsml_arg_converter(
+    '<|DSML|parameter name="command" string="true">git status</|DSML|parameter>',
+    False,
+) == '{"command": "git status"}'
+assert _dsml_arg_converter(
+    '<｜DSML｜parameter name="command" string="true">git status</parameter>',
+    False,
+) == '{"command": "git status"}'

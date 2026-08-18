@@ -5,10 +5,14 @@ DeepSeek-V4 tokenizer changes proposed to the vLLM project in
 [vLLM PR #50686](https://github.com/vllm-project/vllm/pull/50686), commit
 `b68ecd479ca6c29ba36601d6cb00053c6b4fccfb`.
 
+`patches/0002-tolerate-deepseek-v4-dsml-drift.patch` modifies vLLM's
+DeepSeek-V4 streaming parser so equivalent ASCII/full-width DSML markers and
+abbreviated closing tags are parsed into the same tool events.
+
 vLLM is distributed under the Apache License 2.0. The copied and modified patch
 content in this directory remains subject to that license; a copy is included as
 `LICENSE.Apache-2.0`. This notice does not change the MIT license that applies to
 the repository's original deployment scripts and documentation.
 
-The patch is redistributed here solely to make the exact runtime fix reproducible
-against the pinned Anemll container image.
+The patches are redistributed here solely to make the exact runtime fixes
+reproducible against the pinned Anemll container image.

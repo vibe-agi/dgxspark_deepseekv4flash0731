@@ -15,7 +15,7 @@ fi
 
 # --- Docker 镜像 (必须预先拉取) ---
 # IMAGE: Docker 镜像 (registry 地址，新设备上 docker pull 即可获取)
-IMAGE="${IMAGE:-deepseek-v4-flash:0.1.1-stable-pr50686}"
+IMAGE="${IMAGE:-deepseek-v4-flash:0.1.1-stable-20260818}"
 BASE_IMAGE="${BASE_IMAGE:-ghcr.nju.edu.cn/anemll/dspark-vllm-gx10:0.1.1}"
 BUILD_STABLE_RUNTIME="${BUILD_STABLE_RUNTIME:-1}"
 # 回滚镜像: IMAGE="$BASE_IMAGE"

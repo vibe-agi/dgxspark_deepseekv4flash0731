@@ -2,7 +2,7 @@
 
 两台 DGX Spark 通过双路 RoCE 互联运行 DeepSeek V4 Flash（1M context，TP=2 跨节点）。
 
-> 默认使用 FP8 KV、`MAX_NUM_SEQS=6`、同步调度，以及带 vLLM PR #50686 的本地稳定薄层镜像。机器专属值写入被 Git 忽略的 `config.local.sh`。修复原理和回归方法见 [STABILITY.md](STABILITY.md)。
+> 默认使用 FP8 KV、`MAX_NUM_SEQS=6`、同步调度，以及同时修复长历史编码和 DSML 工具协议漂移的本地稳定薄层镜像。机器专属值写入被 Git 忽略的 `config.local.sh`。修复原理和回归方法见 [STABILITY.md](STABILITY.md)。
 
 ---
 
@@ -80,7 +80,7 @@ sudo usermod -aG docker "$USER"
 
 docker pull ghcr.nju.edu.cn/anemll/dspark-vllm-gx10:0.1.1
 BASE_IMAGE=ghcr.nju.edu.cn/anemll/dspark-vllm-gx10:0.1.1 \
-  IMAGE=deepseek-v4-flash:0.1.1-stable-pr50686 \
+  IMAGE=deepseek-v4-flash:0.1.1-stable-20260818 \
   ./stable-runtime/build.sh
 ```
 
@@ -106,7 +106,7 @@ cp config.local.example.sh config.local.sh
 不要把管理网地址、SSH 用户、私有镜像凭据或个人目录写入已跟踪的 `config.sh`。公开默认值位于 `config.sh`：
 
 ```bash
-IMAGE="deepseek-v4-flash:0.1.1-stable-pr50686"
+IMAGE="deepseek-v4-flash:0.1.1-stable-20260818"
 MODEL_PATH="/data/models/deepseek-ai/DeepSeek-V4-Flash-0731"
 HEAD_IP="10.10.12.11"
 WORKER_IP="10.10.12.21"

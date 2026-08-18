@@ -2,8 +2,8 @@
 
 This profile targets long, tool-heavy agent sessions on two DGX Spark nodes. It
 keeps the 1M model limit, FP8 KV cache, prefix caching, chunked prefill, and
-DSpark speculative decoding while removing two failure modes seen in long
-OpenAI-compatible histories.
+DSpark speculative decoding while removing two failure modes seen in long,
+tool-heavy OpenAI-compatible histories.
 
 ## Why short chats can pass while long agents fail
 
@@ -15,9 +15,17 @@ those records independently and can accumulate malformed reasoning/EOS boundarie
 over many tool rounds. The eventual symptoms include repeated actions, leaked
 protocol markup, and nonsensical output even though the KV cache is not full.
 
-The thin image in `stable-runtime/` applies that single upstream tokenizer fix
-to the pinned base image and validates it during the Docker build. It does not
-change or requantize model weights.
+There is a second, independent producer-side failure. DeepSeek V4 normally emits
+tool calls with full-width `<｜DSML｜...>` markers, but long agent runs can drift
+to semantically equivalent ASCII `<|DSML|...>` markers or abbreviated closing
+tags such as `</parameter>`. The pinned vLLM parser recognizes only the canonical
+spelling, so valid tool syntax is returned to the client as visible assistant
+text.
+
+The thin image in `stable-runtime/` applies the upstream tokenizer fix and a
+small tolerant-parser patch to the pinned base image. Its build-time verifier
+checks canonical DSML, ASCII DSML, abbreviated closing tags, and consecutive
+assistant-history merging. It does not change or requantize model weights.
 
 The stability profile also uses:
 
@@ -50,7 +58,7 @@ Or build the overlay directly:
 ```bash
 cd deploy/stable-runtime
 BASE_IMAGE=ghcr.nju.edu.cn/anemll/dspark-vllm-gx10:0.1.1 \
-IMAGE=deepseek-v4-flash:0.1.1-stable-pr50686 \
+IMAGE=deepseek-v4-flash:0.1.1-stable-20260818 \
 ./build.sh
 ```
 
@@ -114,6 +122,14 @@ uncached prefill, the six shared-prefix requests completed in `1.888–2.182s` a
 all returned the exact expected marker. This validates that workload shape; it
 does not establish six-way capacity at the full 1M-token limit.
 
+After adding the tolerant DSML parser, the reproducible probe passed an
+`34,011`-token split assistant/tool history and returned only the expected marker.
+A separate Claude-compatible gateway check passed at `33,343` effective input
+tokens in both streaming and non-streaming modes; both responses contained a
+structured tool call and no DSML/XML text. These checks target the 20–30% client
+meter range where protocol leakage was originally reported; they do not replace a
+longer soak test.
+
 The same hardware/configuration had separately completed a `999,860`-token FP8
 needle request. That demonstrates capacity for one test prompt; it does not mean
 all 1M workloads have equal quality or latency.
@@ -143,7 +159,7 @@ rollback names until the new profile has completed a soak period.
 
 Safe to commit:
 
-- the exact upstream patch and its license notice;
+- the exact tokenizer/parser patches and their license notice;
 - Dockerfile/build verification;
 - example RoCE subnets and interface names;
 - generic startup, prepare, and regression scripts;

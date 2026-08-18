@@ -1,6 +1,6 @@
 # Dual DGX Spark Deployment: DeepSeek V4 Flash 0731
 
-Run **DeepSeek V4 Flash 0731** with a 1M context limit across **two NVIDIA DGX Spark** (GB10, 128GB unified memory each) workstations interconnected via dual-path **RoCE**. The stability-first profile uses FP8 KV cache and a reproducible vLLM tokenizer backport for long agent histories.
+Run **DeepSeek V4 Flash 0731** with a 1M context limit across **two NVIDIA DGX Spark** (GB10, 128GB unified memory each) workstations interconnected via dual-path **RoCE**. The stability-first profile uses FP8 KV cache plus reproducible vLLM tokenizer and DSML-parser fixes for long, tool-heavy agent histories.
 
 > 🇨🇳 中文版见下方 | Gitee 镜像：[gitee.com/alexlu0912_admin/dgxspark_deepseekv4flash0731](https://gitee.com/alexlu0912_admin/dgxspark_deepseekv4flash0731)
 
@@ -10,13 +10,13 @@ Run **DeepSeek V4 Flash 0731** with a 1M context limit across **two NVIDIA DGX S
 
 This repository turns the original two-node recipe into a reproducible, long-agent-stable deployment:
 
-- **Long agent histories degrade or leak protocol markup**: the pinned runtime mishandles adjacent assistant text/reasoning/tool-call records. A thin Docker overlay backports vLLM PR #50686, validates it during the build, and includes a split-history regression probe. Model weights are not modified.
+- **Long agent histories degrade or leak protocol markup**: the pinned runtime mishandles adjacent assistant text/reasoning/tool-call records, while the model can drift from canonical full-width DSML markers to ASCII or abbreviated closing tags. A thin Docker overlay backports vLLM PR #50686 and makes the DeepSeek-V4 tool parser tolerate those equivalent DSML forms. Both fixes are validated during the image build; model weights are not modified or requantized.
 - **Head/Worker containers exit during distributed startup**: the scripts enforce unique ranks, Worker-first startup, dual-HCA RoCE, matching IP/MTU checks, and dynamic IPv4 GID selection instead of a fragile hard-coded GID index.
 - **Setup assumes the operator is root**: `prepare.sh` now runs as an ordinary user and requests targeted `sudo` only for the protected model directory and RoCE configuration; it no longer recursively changes ownership of all `/data`.
 - **A configured 1M limit is mistaken for proven capacity**: the stable profile uses FP8 KV, chunked prefill, prefix caching, `MAX_NUM_SEQS=6`, and synchronous scheduling. It has passed a `999,860`-token single request and six concurrent `79,134`-token shared-prefix requests; six active sequences do not mean 6 × 1M KV capacity.
 - **Client and cluster addresses are confused**: OpenAI-compatible clients use the Head management/LAN endpoint, while the example `10.10.12.0/24` and `10.10.13.0/24` networks remain dedicated to Head/Worker RoCE traffic.
 
-In short: it fixes long-session prompt encoding, makes dual-node startup repeatable, removes root-only setup assumptions, and records a tested stability baseline instead of relying only on advertised configuration values.
+In short: it fixes both sides of long-session protocol failure (history encoding and tool-output parsing), makes dual-node startup repeatable, removes root-only setup assumptions, and records a tested stability baseline instead of relying only on advertised configuration values.
 
 **中文摘要：**本项目修复了长 Agent 多轮后的协议标签泄露/胡言乱语，解决了双机 NCCL/GID/启动顺序导致的容器退出，将 root 视角的准备脚本改为普通用户可用，并给出经长上下文与 6 路并发验证的 FP8 稳定基线。
 
@@ -51,7 +51,7 @@ dgxspark_deepseekv4flash0731/
 │   ├── prepare.sh           #    Environment setup (interactive menu)
 │   ├── start-head.sh        #    Head node startup script
 │   ├── start-worker.sh      #    Worker node startup script
-│   ├── stable-runtime/      #    Reproducible vLLM PR #50686 overlay
+│   ├── stable-runtime/      #    Reproducible tokenizer + tolerant DSML overlay
 │   ├── stability-probe.py   #    Multi-turn / long-context regression
 │   ├── STABILITY.md         #    Root cause, validation, rollback
 │   └── README.md            #    Detailed deployment guide

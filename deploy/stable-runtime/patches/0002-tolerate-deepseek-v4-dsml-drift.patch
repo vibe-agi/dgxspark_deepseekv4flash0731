@@ -1,0 +1,123 @@
+diff --git a/vllm/parser/deepseek_v4.py b/vllm/parser/deepseek_v4.py
+index b47d1ec1..f3ca5fe7 100644
+--- a/vllm/parser/deepseek_v4.py
++++ b/vllm/parser/deepseek_v4.py
+@@ -39,6 +39,7 @@ if TYPE_CHECKING:
+     from vllm.tool_parsers.abstract_tool_parser import Tool
+ 
+ _DSML = "｜DSML｜"
++_DSML_ASCII = "|DSML|"
+ 
+ DSML_THINK_START = "<think>"
+ DSML_THINK_END = "</think>"
+@@ -48,15 +49,26 @@ DSML_INVOKE_PREFIX = f'<{_DSML}invoke name="'
+ DSML_INVOKE_NAME_END = '">'
+ DSML_INVOKE_END = f"</{_DSML}invoke>"
+ DSML_PARAM_CLOSE = f"</{_DSML}parameter>"
++DSML_TOOL_START_ASCII = f"<{_DSML_ASCII}tool_calls>"
++DSML_TOOL_END_ASCII = f"</{_DSML_ASCII}tool_calls>"
++DSML_INVOKE_PREFIX_ASCII = f'<{_DSML_ASCII}invoke name="'
++DSML_INVOKE_END_ASCII = f"</{_DSML_ASCII}invoke>"
++DSML_PARAM_CLOSE_ASCII = f"</{_DSML_ASCII}parameter>"
++DSML_TOOL_END_BARE = "</tool_calls>"
++DSML_INVOKE_END_BARE = "</invoke>"
++DSML_PARAM_CLOSE_BARE = "</parameter>"
+ 
+ _ESCAPED_DSML = re.escape(_DSML)
++_ESCAPED_DSML_ASCII = re.escape(_DSML_ASCII)
++_DSML_PATTERN = rf"(?:{_ESCAPED_DSML}|{_ESCAPED_DSML_ASCII})"
++_PARAM_CLOSE_PATTERN = rf"(?:</{_DSML_PATTERN}parameter>|</parameter>)"
+ _PARAM_RE = re.compile(
+-    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
+-    rf"(.*?)</{_ESCAPED_DSML}parameter>",
++    rf'<{_DSML_PATTERN}parameter\s+name="([^"]+)"\s+string="(true|false)">'
++    rf"(.*?){_PARAM_CLOSE_PATTERN}",
+     re.DOTALL,
+ )
+ _PARTIAL_PARAM_RE = re.compile(
+-    rf'<{_ESCAPED_DSML}parameter\s+name="([^"]+)"\s+string="(true|false)">'
++    rf'<{_DSML_PATTERN}parameter\s+name="([^"]+)"\s+string="(true|false)">'
+     rf"(.*)$",
+     re.DOTALL,
+ )
+@@ -135,6 +147,14 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+             "INVOKE_NAME_END": DSML_INVOKE_NAME_END,
+             "INVOKE_END": DSML_INVOKE_END,
+             "PARAM_CLOSE": DSML_PARAM_CLOSE,
++            "TOOL_START_ASCII": DSML_TOOL_START_ASCII,
++            "TOOL_END_ASCII": DSML_TOOL_END_ASCII,
++            "INVOKE_PREFIX_ASCII": DSML_INVOKE_PREFIX_ASCII,
++            "INVOKE_END_ASCII": DSML_INVOKE_END_ASCII,
++            "PARAM_CLOSE_ASCII": DSML_PARAM_CLOSE_ASCII,
++            "TOOL_END_BARE": DSML_TOOL_END_BARE,
++            "INVOKE_END_BARE": DSML_INVOKE_END_BARE,
++            "PARAM_CLOSE_BARE": DSML_PARAM_CLOSE_BARE,
+         },
+         token_id_terminals={
+             "THINK_START": DSML_THINK_START,
+@@ -169,10 +187,22 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+                 ParserState.TOOL_PREAMBLE,
+                 (),
+             ),
++            (ParserState.REASONING, "TOOL_START_ASCII"): Transition(
++                ParserState.TOOL_PREAMBLE,
++                (EventType.REASONING_END,),
++            ),
++            (ParserState.CONTENT, "TOOL_START_ASCII"): Transition(
++                ParserState.TOOL_PREAMBLE,
++                (),
++            ),
+             (ParserState.TOOL_PREAMBLE, "INVOKE_PREFIX"): Transition(
+                 ParserState.TOOL_NAME,
+                 (EventType.TOOL_CALL_START,),
+             ),
++            (ParserState.TOOL_PREAMBLE, "INVOKE_PREFIX_ASCII"): Transition(
++                ParserState.TOOL_NAME,
++                (EventType.TOOL_CALL_START,),
++            ),
+             (ParserState.TOOL_NAME, "INVOKE_NAME_END"): Transition(
+                 ParserState.TOOL_ARGS,
+                 (),
+@@ -186,15 +216,43 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+                 ParserState.CONTENT,
+                 (EventType.TOOL_CALL_END,),
+             ),
++            (ParserState.TOOL_ARGS, "INVOKE_END_ASCII"): Transition(
++                ParserState.TOOL_BETWEEN,
++                (EventType.TOOL_CALL_END,),
++            ),
++            (ParserState.TOOL_ARGS, "INVOKE_END_BARE"): Transition(
++                ParserState.TOOL_BETWEEN,
++                (EventType.TOOL_CALL_END,),
++            ),
++            (ParserState.TOOL_ARGS, "TOOL_END_ASCII"): Transition(
++                ParserState.CONTENT,
++                (EventType.TOOL_CALL_END,),
++            ),
++            (ParserState.TOOL_ARGS, "TOOL_END_BARE"): Transition(
++                ParserState.CONTENT,
++                (EventType.TOOL_CALL_END,),
++            ),
+             # Parallel tool calls
+             (ParserState.TOOL_BETWEEN, "INVOKE_PREFIX"): Transition(
+                 ParserState.TOOL_NAME,
+                 (EventType.TOOL_CALL_START,),
+             ),
++            (ParserState.TOOL_BETWEEN, "INVOKE_PREFIX_ASCII"): Transition(
++                ParserState.TOOL_NAME,
++                (EventType.TOOL_CALL_START,),
++            ),
+             (ParserState.TOOL_BETWEEN, "TOOL_END"): Transition(
+                 ParserState.CONTENT,
+                 (),
+             ),
++            (ParserState.TOOL_BETWEEN, "TOOL_END_ASCII"): Transition(
++                ParserState.CONTENT,
++                (),
++            ),
++            (ParserState.TOOL_BETWEEN, "TOOL_END_BARE"): Transition(
++                ParserState.CONTENT,
++                (),
++            ),
+         },
+         content_events={
