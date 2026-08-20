@@ -2,7 +2,7 @@
 
 两台 DGX Spark 通过双路 RoCE 互联运行 DeepSeek V4 Flash（1M context，TP=2 跨节点）。
 
-> 默认使用 FP8 KV、`MAX_NUM_SEQS=6`、同步调度，以及同时修复长历史编码和 DSML 工具协议漂移的本地稳定薄层镜像。机器专属值写入被 Git 忽略的 `config.local.sh`。修复原理和回归方法见 [STABILITY.md](STABILITY.md)。
+> 默认使用 padded `nvfp4_ds_mla` KV、`MAX_NUM_SEQS=6`、同步调度和单用户满窗 Prefill 档（16K batch / threshold 0 / memory 0.835），以及只安装 Issue #22 的本地稳定薄层镜像。该镜像同时修复长历史编码和 DSML 工具协议漂移。机器专属值写入被 Git 忽略的 `config.local.sh`。修复原理和回归方法见 [STABILITY.md](STABILITY.md)，实测 A/B 见 [BENCHMARK-20260819.md](BENCHMARK-20260819.md)。
 
 ---
 
@@ -80,7 +80,7 @@ sudo usermod -aG docker "$USER"
 
 docker pull ghcr.nju.edu.cn/anemll/dspark-vllm-gx10:0.1.1
 BASE_IMAGE=ghcr.nju.edu.cn/anemll/dspark-vllm-gx10:0.1.1 \
-  IMAGE=deepseek-v4-flash:0.1.1-stable-20260818 \
+  IMAGE=deepseek-v4-flash:0.1.1-stable-nvfp4-20260819 \
   ./stable-runtime/build.sh
 ```
 
@@ -106,7 +106,7 @@ cp config.local.example.sh config.local.sh
 不要把管理网地址、SSH 用户、私有镜像凭据或个人目录写入已跟踪的 `config.sh`。公开默认值位于 `config.sh`：
 
 ```bash
-IMAGE="deepseek-v4-flash:0.1.1-stable-20260818"
+IMAGE="deepseek-v4-flash:0.1.1-stable-nvfp4-20260819"
 MODEL_PATH="/data/models/deepseek-ai/DeepSeek-V4-Flash-0731"
 HEAD_IP="10.10.12.11"
 WORKER_IP="10.10.12.21"
@@ -307,29 +307,37 @@ docker exec vllm_anemll nvidia-smi
 
 模型 `config.json` 中 `max_position_embeddings: 1048576`，通过 **YaRN**（factor=16）从 65536 扩展到 1M，无需滑动窗口或外推技巧。对应启动参数 `--max-model-len 1048576`。
 
-### 显存管理 — 安全上限 0.78，实际仅 79 GB
+2026-08-20 原生 Anthropic 满窗验证实际输入 `1,039,984` tokens：冷 Prefill `1,050.138s`（约 990 tok/s）；追加轮输入 `1,039,996` tokens，命中 `1,039,872`、只重算 124，Prefix Cache 命中率 `99.9881%`，服务端 TTFT `2.759s`、总耗时 `2.998s`。这证明容量和缓存都正常，但第一次灌入 1M KV 仍是十几分钟级。
 
-`--gpu-memory-utilization 0.78` 是 vLLM 建立执行与 KV cache 预算时使用的上限，不等于容器 RSS，也不能简单用“总内存减权重”推导安全并发。统一内存、CUDA graph、JIT workspace 和系统缓存都会影响启动余量；当前默认值已经完成接近 1M 的单请求验证。
+Prefix Cache 不会省掉客户端上传：无状态 OpenAI/Anthropic 客户端每轮仍发送完整历史。如果 Tailscale/覆盖网络退回 DERP 或其他中继，长请求可能主要卡在上传；应分别比较客户端 wall time 与 vLLM 的 TTFT/e2e 指标。
+
+### 显存管理 — 单用户满窗档 0.835
+
+`--gpu-memory-utilization 0.835` 是 vLLM 建立执行与 KV cache 预算时使用的上限，不等于容器 RSS，也不能简单用“总内存减权重”推导安全并发。它与 16K prefill batch 配套：0.78 + 16K 只剩 8.22 GiB KV，低于 1M 所需的 10.91 GiB；0.835 + 16K 启动时可用 KV 为 15.33 GiB，并已完成 `1,039,984`-token 请求。
 
 | 值 | 效果 |
 |------|------|
-| 0.78（默认） | 已验证的稳定基线 |
+| 0.835（单用户默认） | 16K batch、1M 满窗实测通过 |
+| 0.78（共享服务回退） | 配合 8K batch / threshold 1024，内存余量更大 |
 | 0.75 | KV pool 更小，适合排查内存压力 |
-| 0.80+ | 需要重新做冷启动、长上下文和并发压测 |
+| 0.85+ | 更激进，需要重新做冷启动、长上下文和并发压测 |
 
 ### 并发 — `max-num-seqs=6` + 同步调度
 
 当前默认允许最多 6 条活跃序列，但关闭 vLLM 异步调度，以兼顾多用户吞吐和长 Agent 会话稳定性。双 Spark 实测已通过 6 路、每路 `79,134` prompt tokens 的共享前缀压测。`6` 只是调度上限，不代表 KV pool 能同时容纳 6 条 1M 序列；长下文总容量仍受 KV cache 预算约束。排查时可在 `config.local.sh` 临时设 `MAX_NUM_SEQS=1`。
+
+tracked 默认值优化的是一条活跃满窗请求。一个人同时启动多个 subagent 也属于并发；这类场景如果更重视 decode 公平性，应在两节点 `config.local.sh` 中同时设为 `GPU_MEM=0.78 MAX_BATCHED_TOKENS=8192 LONG_PREFILL_TOKEN_THRESHOLD=1024`。
 
 ### 完整参数表
 
 | 参数 | 值 | 说明 |
 |------|-----|------|
 | `--max-model-len` | `1048576` | 1M token 上下文（YaRN 原生） |
-| `--gpu-memory-utilization` | `0.78` | 显存池上限（实际模型占用约 79GB / 128GB 统一内存） |
+| `--gpu-memory-utilization` | `0.835` | 16K batch 保留 1M KV 容量所需 |
 | `--max-num-seqs` | `6` | 最多 6 条活跃序列；不等于 6 × 1M KV 容量 |
-| `--max-num-batched-tokens` | `8192` | prefill 小块处理（省显存） |
-| `--kv-cache-dtype` | `fp8` | 当前生产配置；已验证接近 1M token |
+| `--max-num-batched-tokens` | `16384` | 单用户冷 Prefill 实测档 |
+| `--long-prefill-token-threshold` | `0` | 允许唯一活跃 Prefill 吃满 batch |
+| `--kv-cache-dtype` | `nvfp4_ds_mla` | padded DSv4 布局；稳定镜像只应用 Issue #22 路由修复 |
 | `--block-size` | `256` | KV Cache block 大小 |
 | `--enable-chunked-prefill` | ✅ | 长 prompt 分块防 OOM |
 | `--enable-prefix-caching` | ✅ | 共享前缀复用 |

@@ -134,7 +134,7 @@ do_pull_image() {
             error "缺少稳定运行时构建脚本：$SCRIPT_DIR/stable-runtime/build.sh"
             return 1
         fi
-        info "将拉取基础镜像并在本机应用 vLLM PR #50686 补丁"
+        info "将拉取基础镜像并构建 tokenizer/DSML + NVFP4 Issue #22 稳定薄层"
         BASE_IMAGE="$BASE_IMAGE" IMAGE="$IMAGE" \
             "$SCRIPT_DIR/stable-runtime/build.sh"
     else

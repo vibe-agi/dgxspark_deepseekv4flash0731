@@ -16,6 +16,7 @@
 8. [启动顺序问题](#8-启动顺序问题)
 9. [Worker 必须从 docker run 启动](#9-worker-必须从-docker-run-启动)
 10. [长 Agent 会话逐渐乱码](#10-长-agent-会话逐渐乱码)
+11. [Prefix Cache 命中但客户端仍很慢](#11-prefix-cache-命中但客户端仍很慢)
 
 ---
 
@@ -215,8 +216,8 @@ Agent 网关可能将一个 assistant turn 重放为相邻的文本、reasoning 
 
 ### 解决
 
-1. 在两台节点构建并使用 `stable-runtime/` 薄层镜像；它只应用 PR #50686 tokenizer 补丁，不修改模型权重。
-2. 使用 FP8 KV、prefix caching、chunked prefill、`MAX_NUM_SEQS=6` 和 `--no-async-scheduling`。
+1. 在两台节点构建并使用 `stable-runtime/` 薄层镜像；它应用 PR #50686、tolerant DSML parser 和独立的 NVFP4 Issue #22 路由补丁，不修改模型权重。
+2. 使用 padded `nvfp4_ds_mla` KV、prefix caching、chunked prefill、`MAX_NUM_SEQS=6` 和 `--no-async-scheduling`。单用户满窗档使用 `batch=16384 / threshold=0 / GPU_MEM=0.835`；并发公平档使用 `8192 / 1024 / 0.78`。
 3. 运行协议回归：
 
 ```bash
@@ -230,3 +231,33 @@ Agent 网关可能将一个 assistant turn 重放为相邻的文本、reasoning 
 ```
 
 已验证的双 Spark 基线中，6 路请求每路为 `79,134` prompt tokens，全部返回精确标记，无协议标签泄露。若只有真实业务会话仍失败，将该请求形状脱敏后加入回归；不要仅在网关层逐个替换特殊标签。
+
+---
+
+## 11. Prefix Cache 命中但客户端仍很慢
+
+### 现象
+
+vLLM 指标显示 `local_cache_hit` 接近 100%，服务端 Prefill/TTFT 很短，但 Claude、Cherry Studio 或远程 Agent 仍要等待几十秒甚至数分钟。
+
+### 根因
+
+Prefix Cache 只复用 DGX 上的 KV，OpenAI/Anthropic API 仍是无状态请求：客户端每轮必须把完整 system、tools、messages 和工具结果重新上传。若 Tailscale 没有建立 peer-to-peer 直连而退回 DERP/其他中继，长 JSON 请求体的上传时间不会出现在 vLLM TTFT 中。
+
+一次实测中，约 1.04 MB、250,037-token 请求的客户端 wall time 为 193.5s，而服务端 e2e 为 140.9s；缓存追加轮命中 99.923%，但仍有约 42.7s 花在引擎之外。满窗请求体约 4.33 MB，远程上传影响会更明显。
+
+### 排查顺序
+
+```bash
+# 1. 检查是否直连；输出含 DERP/relay 表示仍经中继
+tailscale ping <head-tailscale-ip>
+
+# 2. Head 本机测服务端
+curl -sS http://127.0.0.1:8888/health
+
+# 3. 查看实际 token 来源与 TTFT
+curl -sS http://127.0.0.1:8888/metrics | \
+  grep -E 'prompt_tokens_by_source|time_to_first_token|request_prefill_time'
+```
+
+优先修复覆盖网络直连或改走现场管理 LAN。不要因为客户端 wall time 长就安装外置 KV/LMCache；对于单用户、重启不要求保留会话的场景，本地 Prefix Cache 已足够。先确认 `local_compute`、`local_cache_hit`、服务端 TTFT 与客户端 wall time各自占比。

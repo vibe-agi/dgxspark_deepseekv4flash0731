@@ -1,6 +1,6 @@
 # Dual DGX Spark Deployment: DeepSeek V4 Flash 0731
 
-Run **DeepSeek V4 Flash 0731** with a 1M context limit across **two NVIDIA DGX Spark** (GB10, 128GB unified memory each) workstations interconnected via dual-path **RoCE**. The stability-first profile uses FP8 KV cache plus reproducible vLLM tokenizer and DSML-parser fixes for long, tool-heavy agent histories.
+Run **DeepSeek V4 Flash 0731** with a 1M context limit across **two NVIDIA DGX Spark** (GB10, 128GB unified memory each) workstations interconnected via dual-path **RoCE**. The current single-user/full-window profile uses padded NVFP4 DS-MLA KV plus reproducible vLLM tokenizer, DSML-parser, and isolated NVFP4 kernel-dispatch fixes for long, tool-heavy agent histories.
 
 > 🇨🇳 中文版见下方 | Gitee 镜像：[gitee.com/alexlu0912_admin/dgxspark_deepseekv4flash0731](https://gitee.com/alexlu0912_admin/dgxspark_deepseekv4flash0731)
 
@@ -13,12 +13,20 @@ This repository turns the original two-node recipe into a reproducible, long-age
 - **Long agent histories degrade or leak protocol markup**: the pinned runtime mishandles adjacent assistant text/reasoning/tool-call records, while the model can drift from canonical full-width DSML markers to ASCII or abbreviated closing tags. A thin Docker overlay backports vLLM PR #50686 and makes the DeepSeek-V4 tool parser tolerate those equivalent DSML forms. Both fixes are validated during the image build; model weights are not modified or requantized.
 - **Head/Worker containers exit during distributed startup**: the scripts enforce unique ranks, Worker-first startup, dual-HCA RoCE, matching IP/MTU checks, and dynamic IPv4 GID selection instead of a fragile hard-coded GID index.
 - **Setup assumes the operator is root**: `prepare.sh` now runs as an ordinary user and requests targeted `sudo` only for the protected model directory and RoCE configuration; it no longer recursively changes ownership of all `/data`.
-- **A configured 1M limit is mistaken for proven capacity**: the stable profile uses FP8 KV, chunked prefill, prefix caching, `MAX_NUM_SEQS=6`, and synchronous scheduling. It has passed a `999,860`-token single request and six concurrent `79,134`-token shared-prefix requests; six active sequences do not mean 6 × 1M KV capacity.
+- **NVFP4 and scheduler hotfixes are applied as an untested bundle**: the stable image installs only the Issue #22 fast-kernel route. A full candidate bundle stalled on the third 8K cold request; the isolated image completed 10/10, six-way mixed-prefill tests, 128K requests, and a 239,869-token native Anthropic agent/tool history.
+- **A configured 1M limit is mistaken for proven capacity**: the selected profile completed a native Anthropic request with `1,039,984` input tokens and then appended a turn at `99.9881%` prompt-cache hit. Cold prefill took `1,050.1s`; the cached append completed server-side in `3.0s`. Six active sequences do not mean 6 × 1M KV capacity.
+- **A warm server can still feel slow remotely**: prefix caching removes repeated GPU prefill, but a stateless client still uploads the full JSON history on every turn. A relayed overlay-network control added `42.7s` outside the engine for a repeated 1.04 MB history; prefer a direct LAN/overlay path and distinguish client wall time from server TTFT.
 - **Client and cluster addresses are confused**: OpenAI-compatible and Anthropic-compatible clients use the Head management/LAN endpoint, while the example `10.10.12.0/24` and `10.10.13.0/24` networks remain dedicated to Head/Worker RoCE traffic.
 
 In short: it fixes both sides of long-session protocol failure (history encoding and tool-output parsing), makes dual-node startup repeatable, removes root-only setup assumptions, and records a tested stability baseline instead of relying only on advertised configuration values.
 
-**中文摘要：**本项目修复了长 Agent 多轮后的协议标签泄露/胡言乱语，解决了双机 NCCL/GID/启动顺序导致的容器退出，将 root 视角的准备脚本改为普通用户可用，并给出经长上下文与 6 路并发验证的 FP8 稳定基线。
+The dated A/B matrix and rejection evidence are in
+[`deploy/BENCHMARK-20260819.md`](deploy/BENCHMARK-20260819.md).
+
+**中文摘要：**本项目修复了长 Agent 多轮后的协议标签泄露/胡言乱语，解决双机 NCCL/GID/启动顺序导致的容器退出，将 root 视角的准备脚本改为普通用户可用，并通过逐补丁 A/B 收敛到 Issue #22-only 的 NVFP4 稳定配置；已验证 24 万 token 原生 Anthropic 工具历史和 6 路并发，不会把整套实验补丁直接装进生产镜像。
+
+完整 A/B 矩阵与淘汰依据见
+[`deploy/BENCHMARK-20260819.md`](deploy/BENCHMARK-20260819.md)。
 
 ---
 
@@ -35,7 +43,7 @@ In short: it fixes both sides of long-session protocol failure (history encoding
 
 - **TP=2** across 2 GB10 GPUs (1 per node), **PP=1**, **NNODES=2**
 - **Network**: two RoCE v2 paths, dynamic GID selection, MTU 9000
-- **Runtime**: FP8 KV, 1M model limit, DSpark speculative decoding
+- **Runtime**: padded NVFP4 DS-MLA KV, 1M model limit, DSpark speculative decoding
 - **Clients**: use the Head management/LAN or Tailscale address, not the RoCE data-plane address
 
 ---
@@ -51,7 +59,7 @@ dgxspark_deepseekv4flash0731/
 │   ├── prepare.sh           #    Environment setup (interactive menu)
 │   ├── start-head.sh        #    Head node startup script
 │   ├── start-worker.sh      #    Worker node startup script
-│   ├── stable-runtime/      #    Reproducible tokenizer + tolerant DSML overlay
+│   ├── stable-runtime/      #    Tokenizer/DSML + isolated NVFP4 Issue #22 overlay
 │   ├── stability-probe.py   #    Multi-turn / long-context regression
 │   ├── STABILITY.md         #    Root cause, validation, rollback
 │   └── README.md            #    Detailed deployment guide
@@ -289,6 +297,9 @@ GB10 provides 128 GB unified memory per node. Observed model loading used about 
 |----------|-----------|------|--------|
 | Code generation (500 tokens) | **~61 tok/s** | ~960ms | 79 GB/node |
 | Long text generation (500 tokens) | ~45 tok/s | ~1s | 79 GB/node |
+| 88K cold prefill (single-user lane) | **2,075 input tok/s** | 42.43s | 0.835 budget |
+| 1,039,984-token cold prefill | **990 input tok/s** | 1,052.52s | full-window gate |
+| 1,039,996-token cached append | 99.9881% cache hit | 2.759s | 3.0s server e2e |
 
 ---
 
@@ -298,19 +309,26 @@ GB10 provides 128 GB unified memory per node. Observed model loading used about 
 
 Model natively supports 1M token context (`max_position_embeddings: 1048576` in `config.json`, extended 16× from 65536 via YaRN). No sliding window or extrapolation tricks needed.
 
-### GPU Memory: `--gpu-memory-utilization 0.78`
+### GPU Memory: `--gpu-memory-utilization 0.835`
 
-**This is a safety ceiling, not process RSS.** Unified memory, CUDA graphs, JIT workspaces, and host caches all consume the same pool. The default has completed a near-1M single request; do not infer safe concurrency from weight size alone.
+**This is a safety ceiling, not process RSS.** Unified memory, CUDA graphs, JIT workspaces, and host caches all consume the same pool. The 0.835 single-user profile completed a 1,039,984-token request. It is paired with the 16K prefill batch; at 0.78 that batch left only 8.22 GiB KV versus 10.91 GiB required for 1M.
 
 | Value | Effect |
 |-------|--------|
-| 0.78 (current) | Ceiling ~100 GB, actual ~79 GB, safe |
+| 0.835 (single-user default) | 15.33 GiB available KV at startup; full-window gate passed |
+| 0.78 (shared-service fallback) | Wider unified-memory margin; pair with 8K batch |
 | 0.75 | Minimum viable; lower may be rejected |
 | 0.85 | More aggressive; may OOM at peak concurrency |
 
 ### Concurrency: `--max-num-seqs 6` with synchronous scheduling
 
 The validated default keeps up to six sequences active while using `--no-async-scheduling`. A dual-Spark test passed six concurrent requests of `79,134` prompt tokens each. This is a scheduler cap, not capacity for six independent 1M contexts; total live KV still has to fit the measured cache pool.
+
+The tracked defaults optimize one active full-window request. A single human
+launching several subagents is still concurrent: use
+`GPU_MEM=0.78 MAX_BATCHED_TOKENS=8192 LONG_PREFILL_TOKEN_THRESHOLD=1024` when
+decode fairness between those requests matters more than the fastest cold
+prefill for one request.
 
 | Value | Use Case | Memory Pressure |
 |-------|----------|-----------------|
@@ -325,12 +343,13 @@ The validated default keeps up to six sequences active while using `--no-async-s
 --tensor-parallel-size 2          # TP=2 across 2 GPUs (1 per node)
 --pipeline-parallel-size 1        # PP=1
 --nnodes 2                        # 2 nodes
---kv-cache-dtype fp8              # Validated stable profile
+--kv-cache-dtype nvfp4_ds_mla     # Padded DSv4 layout + isolated Issue #22 fix
 --block-size 256                  # KV Cache block size
 --max-model-len 1048576           # 1M token context (native YaRN)
 --max-num-seqs 6                  # Up to 6 active sequences; not 6 × 1M capacity
---max-num-batched-tokens 8192     # Prefill batch (small chunks save memory)
---gpu-memory-utilization 0.78     # Memory safety ceiling (~79GB / 128GB unified)
+--max-num-batched-tokens 16384    # Validated single-user prefill batch
+--long-prefill-token-threshold 0  # Let one active prefill consume the batch
+--gpu-memory-utilization 0.835    # Required with 16K batch to retain 1M capacity
 --enable-chunked-prefill          # Chunk long prompts to avoid prefill OOM
 --enable-prefix-caching           # Reuse KV Cache for shared prefixes
 --no-async-scheduling             # Avoid long-prefix scheduler races
@@ -467,7 +486,7 @@ MIT
 
 # DGX Spark 双机部署 DeepSeek V4 Flash 0731
 
-两台 NVIDIA DGX Spark（GB10，每节点 128 GB 统一内存）通过双路 RoCE 互联，运行 **DeepSeek V4 Flash 0731**。稳定优先配置使用 FP8 KV、1M 上限和可复现的 vLLM tokenizer 回移补丁。
+两台 NVIDIA DGX Spark（GB10，每节点 128 GB 统一内存）通过双路 RoCE 互联，运行 **DeepSeek V4 Flash 0731**。当前单用户满窗配置使用 padded NVFP4 DS-MLA KV、1M 上限，以及可复现的 tokenizer、DSML parser 和 Issue #22 内核路由补丁。
 
 > 🇬🇧 English version above | GitHub：[github.com/vibe-agi/dgxspark_deepseekv4flash0731](https://github.com/vibe-agi/dgxspark_deepseekv4flash0731)
 
@@ -485,7 +504,7 @@ MIT
 
 - **TP=2** 跨两块 GB10 GPU（每节点 1 块），**PP=1**，**NNODES=2**
 - **网络**：两条 RoCE v2 路径，动态 GID，MTU 9000
-- **运行时**：FP8 KV、1M 上限、DSpark speculative decoding
+- **运行时**：padded NVFP4 DS-MLA KV、1M 上限、DSpark speculative decoding
 - **客户端**：使用 Head 管理网/LAN 或 Tailscale 地址，不使用 RoCE 数据面地址
 
 ---
@@ -501,7 +520,7 @@ dgxspark_deepseekv4flash0731/
 │   ├── prepare.sh           #    环境准备脚本 (交互式菜单)
 │   ├── start-head.sh        #    Head 节点启动脚本
 │   ├── start-worker.sh      #    Worker 节点启动脚本
-│   ├── stable-runtime/      #    vLLM PR #50686 稳定薄层
+│   ├── stable-runtime/      #    tokenizer/DSML + NVFP4 Issue #22 稳定薄层
 │   ├── stability-probe.py   #    多轮/长上下文回归
 │   ├── STABILITY.md         #    根因、验证、回滚
 │   └── README.md            #    详细部署说明书
@@ -714,6 +733,11 @@ GB10 每节点有 128 GB 统一内存。实测模型加载约占 79 GiB/节点�
 |------|------|------|------|
 | 代码生成 (500 tokens) | **~61 tok/s** | ~960ms | 79 GB/节点 |
 | 长文本生成 (500 tokens) | ~45 tok/s | ~1s | 79 GB/节点 |
+| 88K 冷 Prefill（单用户档） | **2,075 input tok/s** | 42.43s | 0.835 预算 |
+| 1,039,984-token 冷 Prefill | **990 input tok/s** | 1,052.52s | 满窗验证 |
+| 1,039,996-token 缓存追加 | 99.9881% 命中 | 2.759s | 服务端总计 3.0s |
+
+Prefix Cache 只避免 DGX 重算，不会阻止无状态客户端每轮重新上传完整历史。一次 1.04 MB、250K-token 请求经中继型覆盖网络时，客户端比服务端额外等待约 52.7 秒；缓存追加轮仍有约 42.7 秒花在引擎之外。远程使用应优先让 Tailscale/覆盖网络建立直连，并分别观察客户端 wall time 与服务端 TTFT。
 
 ---
 
@@ -723,19 +747,22 @@ GB10 每节点有 128 GB 统一内存。实测模型加载约占 79 GiB/节点�
 
 模型原生支持 1M token 上下文（`config.json` 中 `max_position_embeddings: 1048576`，通过 YaRN 从 65536 扩展 16 倍）。无需滑动窗口或外推技巧。
 
-### 显存管理：`--gpu-memory-utilization 0.78`
+### 显存管理：`--gpu-memory-utilization 0.835`
 
-**这是安全上限，不是实际占用。** 统一内存还要容纳 CUDA Graph、JIT workspace 和系统缓存。当前启动日志报告 GPU KV cache 容量约 `1,414,392` tokens；它可以接纳一条接近 1M 的序列，但不可能同时容纳 6 条 1M 序列。
+**这是安全上限，不是实际占用。** 统一内存还要容纳 CUDA Graph、JIT workspace 和系统缓存。0.835 单用户档已实际完成 `1,039,984`-token 请求；它必须和 16K prefill batch 配套。16K batch 在 0.78 下只剩 8.22 GiB KV，低于 1M 所需的 10.91 GiB，vLLM 会拒绝启动。
 
 | 值 | 效果 |
 |------|------|
-| 0.78（当前） | 上限 ~100 GB，实际 79 GB，安全 |
+| 0.835（单用户默认） | 启动时可用 KV 15.33 GiB；满窗实测通过 |
+| 0.78（共享服务回退） | 统一内存余量更大；应配 8K batch |
 | 0.75 | 最低可用值，再低 vLLM 可能拒绝启动 |
 | 0.85 | 更激进，极限并发可能 OOM |
 
 ### 并发控制：`--max-num-seqs 6`
 
 最多保持 6 条活跃序列，并配合 `--no-async-scheduling`。实测已通过 6 路、每路 `79,134` prompt tokens 的共享前缀请求。这是调度上限，不是 6 × 1M 容量：
+
+当前 tracked 默认值优化的是“一条活跃满窗请求”。一个人同时启动多个 subagent 也属于并发；如果更关心这些请求之间的 decode 公平性，应使用 `GPU_MEM=0.78 MAX_BATCHED_TOKENS=8192 LONG_PREFILL_TOKEN_THRESHOLD=1024` 回退档。
 
 | 值 | 适用场景 | 显存压力 |
 |------|----------|---------|
@@ -750,12 +777,13 @@ GB10 每节点有 128 GB 统一内存。实测模型加载约占 79 GiB/节点�
 --tensor-parallel-size 2          # TP=2 跨 2 张 GPU（两节点各一）
 --pipeline-parallel-size 1        # PP=1
 --nnodes 2                        # 2 个节点
---kv-cache-dtype fp8              # 当前经验证的 KV cache 类型
+--kv-cache-dtype nvfp4_ds_mla     # padded DSv4 布局 + 独立 Issue #22 修复
 --block-size 256                  # KV Cache block 大小
 --max-model-len 1048576           # 1M token 上下文（YaRN 原生）
 --max-num-seqs 6                  # 最多 6 条活跃序列，不等于 6 × 1M
---max-num-batched-tokens 8192     # prefill 批次（小块省显存）
---gpu-memory-utilization 0.78     # 显存安全上限（~79GB / 128GB 统一内存）
+--max-num-batched-tokens 16384    # 单用户冷 Prefill 实测档
+--long-prefill-token-threshold 0  # 让唯一活跃 Prefill 吃满 batch
+--gpu-memory-utilization 0.835    # 16K batch 保留 1M 容量所需
 --enable-chunked-prefill          # 长 prompt 分块防 OOM
 --enable-prefix-caching           # 共享前缀复用 KV Cache
 --no-async-scheduling             # 关闭异步调度，保留 6 序列上限
@@ -852,7 +880,7 @@ huggingface-cli download deepseek-ai/DeepSeek-V4-Flash-0731 \
   --local-dir /data/models/deepseek-ai/DeepSeek-V4-Flash-0731
 ```
 
-> 这里使用官方 Flash 0731 混合精度权重，总大小约 **156 GB**，建议预留 180–200 GB。`--kv-cache-dtype fp8` 描述的是运行时 KV cache，不是对权重的二次量化。两台节点都需下载。
+> 这里使用官方 Flash 0731 混合精度权重，总大小约 **156 GB**，建议预留 180–200 GB。`--kv-cache-dtype nvfp4_ds_mla` 只描述运行时 KV cache，不会二次量化模型权重；本运行时使用 584-byte padded DSv4 MLA 布局，也不能理解成 KV 占用减半。两台节点都需下载。
 
 ### 方式二：ModelScope（国内镜像，更快）
 

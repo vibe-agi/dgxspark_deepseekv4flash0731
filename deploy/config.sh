@@ -15,7 +15,7 @@ fi
 
 # --- Docker 镜像 (必须预先拉取) ---
 # IMAGE: Docker 镜像 (registry 地址，新设备上 docker pull 即可获取)
-IMAGE="${IMAGE:-deepseek-v4-flash:0.1.1-stable-20260818}"
+IMAGE="${IMAGE:-deepseek-v4-flash:0.1.1-stable-nvfp4-20260819}"
 BASE_IMAGE="${BASE_IMAGE:-ghcr.nju.edu.cn/anemll/dspark-vllm-gx10:0.1.1}"
 BUILD_STABLE_RUNTIME="${BUILD_STABLE_RUNTIME:-1}"
 # 回滚镜像: IMAGE="$BASE_IMAGE"
@@ -49,11 +49,19 @@ MAX_MODEL_LEN="${MAX_MODEL_LEN:-1048576}" # 1M 上下文
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-6}" # 最多 6 条活跃序列；保留同步调度以兼顾稳定性
 TP_SIZE="${TP_SIZE:-2}"
 PP_SIZE="${PP_SIZE:-1}"
-GPU_MEM="${GPU_MEM:-0.78}"
+GPU_MEM="${GPU_MEM:-0.835}"
 BLOCK_SIZE="${BLOCK_SIZE:-256}"
-MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-8192}"
-MAX_CUDAGRAPH="${MAX_CUDAGRAPH:-72}"
-KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+MAX_BATCHED_TOKENS="${MAX_BATCHED_TOKENS:-16384}"
 MTP_NUM_TOKENS="${MTP_NUM_TOKENS:-5}"
+MAX_CUDAGRAPH="${MAX_CUDAGRAPH:-$((MAX_NUM_SEQS * (MTP_NUM_TOKENS + 1)))}"
+KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-nvfp4_ds_mla}"
+# Single-user/full-window profile: let one long prefill consume the batch.
+# Shared services or concurrent subagents should override this to 1024 and may
+# also prefer MAX_BATCHED_TOKENS=8192 with GPU_MEM=0.78 for a wider safety margin.
+LONG_PREFILL_TOKEN_THRESHOLD="${LONG_PREFILL_TOKEN_THRESHOLD:-0}"
+VLLM_USE_BREAKABLE_CUDAGRAPH="${VLLM_USE_BREAKABLE_CUDAGRAPH:-0}"
+# Only enable this together with the Issue #26 coordinator hotfix.  Passing it
+# to the unpatched/base runtime can create unsafe hybrid-SWA warm-cache hits.
+VLLM_PREFIX_CACHE_RETENTION_INTERVAL="${VLLM_PREFIX_CACHE_RETENTION_INTERVAL:-}"
 SERVED_NAME="${SERVED_NAME:-deepseek-v4-flash}"
 PORT="${PORT:-8888}"

@@ -3,8 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE_IMAGE="${BASE_IMAGE:-ghcr.nju.edu.cn/anemll/dspark-vllm-gx10:0.1.1}"
-IMAGE="${IMAGE:-deepseek-v4-flash:0.1.1-stable-20260818}"
-CREATED="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+IMAGE="${IMAGE:-deepseek-v4-flash:0.1.1-stable-nvfp4-20260819}"
+CREATED="${CREATED:-2026-08-19T00:00:00Z}"
 
 if ! docker image inspect "$BASE_IMAGE" >/dev/null 2>&1; then
     docker pull "$BASE_IMAGE"
@@ -13,7 +13,7 @@ docker build \
     --build-arg "BASE_IMAGE=$BASE_IMAGE" \
     --label "org.opencontainers.image.created=$CREATED" \
     --label "org.opencontainers.image.base.name=$BASE_IMAGE" \
-    --label "org.opencontainers.image.revision=vllm-pr-50686-plus-dsml-drift" \
+    --label "org.opencontainers.image.revision=miaai-8997d417-issue22-plus-vllm-pr-50686-dsml" \
     --tag "$IMAGE" \
     "$SCRIPT_DIR"
 

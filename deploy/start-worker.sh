@@ -10,6 +10,13 @@ set -e
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/config.sh"
 
+OPTIONAL_DOCKER_ENVS=()
+if [ -n "$VLLM_PREFIX_CACHE_RETENTION_INTERVAL" ]; then
+    OPTIONAL_DOCKER_ENVS+=(
+        -e "VLLM_PREFIX_CACHE_RETENTION_INTERVAL=$VLLM_PREFIX_CACHE_RETENTION_INTERVAL"
+    )
+fi
+
 echo "========================================"
 echo " DeepSeek V4 Flash - Worker Node Launcher"
 echo "========================================"
@@ -83,6 +90,8 @@ echo "🚀 启动 DeepSeek V4 Flash Worker 节点..."
 echo "   NCCL: dual HCA, dynamic GID (AF_INET, RoCE v2, $ROCE_SUBNET)"
 echo "   Worker IP: $WORKER_IP  →  Head: ${HEAD_IP}:${MASTER_PORT}"
 echo "   KV=$KV_CACHE_DTYPE  DSpark k=$MTP_NUM_TOKENS"
+echo "   long-prefill=$LONG_PREFILL_TOKEN_THRESHOLD  breakable-cudagraph=$VLLM_USE_BREAKABLE_CUDAGRAPH"
+echo "   prefix-cache-retention=${VLLM_PREFIX_CACHE_RETENTION_INTERVAL:-disabled}"
 echo ""
 
 docker run -d --name vllm_anemll \
@@ -124,6 +133,8 @@ docker run -d --name vllm_anemll \
     -e VLLM_USE_FLASHINFER_SAMPLER=1 \
     -e VLLM_SPARSE_INDEXER_MAX_LOGITS_MB=256 \
     -e VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 \
+    -e VLLM_USE_BREAKABLE_CUDAGRAPH="$VLLM_USE_BREAKABLE_CUDAGRAPH" \
+    "${OPTIONAL_DOCKER_ENVS[@]}" \
     -e VLLM_DSPARK_GPU_REJECTED_CONTEXT_MASK=1 \
     -e VLLM_DSPARK_HARDWARE_SCHEDULER_EARLY_STOP=1 \
     -e VLLM_DSPARK_LOCAL_ARGMAX=1 \
@@ -151,6 +162,7 @@ docker run -d --name vllm_anemll \
         --max-model-len "$MAX_MODEL_LEN" \
         --max-num-seqs "$MAX_NUM_SEQS" \
         --max-num-batched-tokens "$MAX_BATCHED_TOKENS" \
+        --long-prefill-token-threshold "$LONG_PREFILL_TOKEN_THRESHOLD" \
         --max-cudagraph-capture-size "$MAX_CUDAGRAPH" \
         --gpu-memory-utilization "$GPU_MEM" \
         --enable-prefix-caching \

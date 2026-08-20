@@ -12,9 +12,9 @@
 
 ## KV cache 与长上下文
 
-### `--kv-cache-dtype fp8`
+### `--kv-cache-dtype nvfp4_ds_mla`
 
-当前生产基线使用 FP8 KV cache，已完成接近 1M token 的单请求验证。这个参数仅描述运行时 KV cache，不会将模型权重改成 NVFP4。
+当前生产基线使用 padded NVFP4 DS-MLA KV cache，并通过稳定镜像中的 Issue #22 补丁路由到已验证的快速内核。这里的布局仍为 584 bytes，与 `fp8_ds_mla` 的 padded 布局相同，不等于 KV 占用减半，也不会改变或二次量化模型权重。
 
 ### `--block-size 256`
 
@@ -26,7 +26,11 @@ KV cache block 大小。当前镜像与 1M profile 的已验证值，改动后�
 
 ### `--enable-chunked-prefill`
 
-将长 prompt 分块 prefill，避免一次将整个 prompt 塞入调度批次。与 `--max-num-batched-tokens 8192` 配合使用。
+将长 prompt 分块 prefill，避免一次将整个 prompt 塞入调度批次。当前单用户满窗档与 `--max-num-batched-tokens 16384` 配合使用；共享服务回退档为 8192。
+
+### `--long-prefill-token-threshold 0`
+
+`0` 允许一条长 prefill 吃满 batch，适合当前只有一条活跃请求的满窗场景。88K 冷 Prefill 相比 threshold 1024 从 52.635s 降到 45.100s。一个人同时运行多个 subagent 也属于并发；此时应回退到 `1024`，避免一条 prefill 让其他请求的 decode 饥饿。
 
 ### `--enable-prefix-caching`
 
@@ -34,9 +38,9 @@ KV cache block 大小。当前镜像与 1M profile 的已验证值，改动后�
 
 ## 显存与并发
 
-### `--gpu-memory-utilization 0.78`
+### `--gpu-memory-utilization 0.835`
 
-vLLM 可用统一内存的预算上限。它不是进程 RSS，也不能用“128 GB 减去权重”直接推导并发容量。CUDA Graph、JIT workspace、NCCL buffer 和系统缓存也使用同一内存池。
+vLLM 可用统一内存的预算上限。它不是进程 RSS，也不能用“128 GB 减去权重”直接推导并发容量。CUDA Graph、JIT workspace、NCCL buffer 和系统缓存也使用同一内存池。16K batch 在 0.78 下只剩 8.22 GiB KV，低于 1M 所需的 10.91 GiB；0.835 下可用 KV 为 15.33 GiB，并已完成 `1,039,984`-token 满窗请求。
 
 ### `--max-num-seqs 6`
 
@@ -45,6 +49,10 @@ vLLM 可用统一内存的预算上限。它不是进程 RSS，也不能用“12
 ### `--no-async-scheduling`
 
 关闭 vLLM 的异步调度器，但不会将 `max-num-seqs=6` 改成串行。当前将“6 条活跃序列 + 同步调度”作为长 Agent 会话的稳定基线。
+
+### `VLLM_USE_BREAKABLE_CUDAGRAPH=0`
+
+明确使用 regular CUDA Graph。Anemll 自动启用的 breakable graph 在此双机实测更慢；`MAX_CUDAGRAPH` 默认按 `MAX_NUM_SEQS × (MTP_NUM_TOKENS + 1)` 推导，6×5 时为 36。
 
 ## DGX Spark 专有参数
 
@@ -77,8 +85,9 @@ NCCL_SOCKET_IFNAME=enp1s0f0np0
 
 | 问题 | 调整顺序 |
 |------|----------|
-| 启动 OOM | 先看是否有其他 GPU/统一内存进程，再将 `GPU_MEM` 从 0.78 降到 0.75 |
+| 16K batch 启动时报 1M KV 不足 | 保持 `GPU_MEM=0.835`；或整体回退为 `0.78 + batch 8192 + threshold 1024` |
+| 启动 OOM | 先看是否有其他 GPU/统一内存进程；需要降内存时同时缩小 batch，并重做 1M gate |
 | NCCL 初始化失败 | 检查双向 IP/MTU/HCA，清除固定 `NCCL_IB_GID_INDEX` |
 | 长 Agent 输出协议标签 | 确认稳定镜像包含 vLLM PR #50686，运行 `stability-probe.py` |
-| 疑似并发竞争 | 临时设 `MAX_NUM_SEQS=1`；若消失，按 2→4→6 重放真实会话 |
+| 疑似并发竞争 | 先设 `LONG_PREFILL_TOKEN_THRESHOLD=1024`，必要时再临时设 `MAX_NUM_SEQS=1`；若消失，按 2→4→6 重放真实会话 |
 | 需要更高吞吐 | 先用 6 路长历史建立基线，再逐级增加；不根据权重占用推导“安全并发” |

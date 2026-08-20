@@ -1,7 +1,7 @@
 # Long-agent stability profile
 
 This profile targets long, tool-heavy agent sessions on two DGX Spark nodes. It
-keeps the 1M model limit, FP8 KV cache, prefix caching, chunked prefill, and
+keeps the 1M model limit, padded NVFP4 DS-MLA KV cache, prefix caching, chunked prefill, and
 DSpark speculative decoding while removing two failure modes seen in long,
 tool-heavy OpenAI-compatible histories.
 
@@ -22,19 +22,23 @@ tags such as `</parameter>`. The pinned vLLM parser recognizes only the canonica
 spelling, so valid tool syntax is returned to the client as visible assistant
 text.
 
-The thin image in `stable-runtime/` applies the upstream tokenizer fix and a
-small tolerant-parser patch to the pinned base image. Its build-time verifier
-checks canonical DSML, ASCII DSML, abbreviated closing tags, and consecutive
-assistant-history merging. It does not change or requantize model weights.
+The thin image in `stable-runtime/` applies the upstream tokenizer fix, a small
+tolerant-parser patch, and only the MiaAI Issue #22 NVFP4 kernel-dispatch fix to
+the pinned base image. Its build-time verifier checks canonical DSML, ASCII
+DSML, abbreviated closing tags, consecutive assistant-history merging, and the
+NVFP4 fast-path marker. It does not change or requantize model weights.
 
-The stability profile also uses:
+The tracked single-user/full-window profile also uses:
 
 ```text
 --max-num-seqs 6
 --no-async-scheduling
 --enable-prefix-caching
 --enable-chunked-prefill
---kv-cache-dtype fp8
+--kv-cache-dtype nvfp4_ds_mla
+--max-num-batched-tokens 16384
+--long-prefill-token-threshold 0
+--gpu-memory-utilization 0.835
 ```
 
 Synchronous scheduling is deliberate, but it is not the same as serial execution:
@@ -43,6 +47,16 @@ This profile was validated with six concurrent requests of `79,134` prompt token
 each. `MAX_NUM_SEQS=6` is a scheduling cap, not a promise that the KV pool can hold
 six independent 1M-token contexts. Use `MAX_NUM_SEQS=1` as an isolation/diagnostic
 fallback if a workload still exposes a concurrency-dependent failure.
+
+`LONG_PREFILL_TOKEN_THRESHOLD=0` optimizes one active cold prefill. A single
+operator launching several subagents is still concurrent. For a shared service
+or decode-fairness validation, set the same overrides on both nodes:
+
+```text
+GPU_MEM=0.78
+MAX_BATCHED_TOKENS=8192
+LONG_PREFILL_TOKEN_THRESHOLD=1024
+```
 
 ## Build
 
@@ -58,7 +72,7 @@ Or build the overlay directly:
 ```bash
 cd deploy/stable-runtime
 BASE_IMAGE=ghcr.nju.edu.cn/anemll/dspark-vllm-gx10:0.1.1 \
-IMAGE=deepseek-v4-flash:0.1.1-stable-20260818 \
+IMAGE=deepseek-v4-flash:0.1.1-stable-nvfp4-20260819 \
 ./build.sh
 ```
 
@@ -83,6 +97,46 @@ bash start-head.sh
 Client traffic must use the Head management/LAN address. `HEAD_IP` in
 `config.sh` is the RoCE data-plane address for distributed initialization, not a
 universal client endpoint.
+
+## 2026-08-19 NVFP4 isolation result
+
+The final image was selected by changing one runtime layer at a time. A candidate
+image containing the complete MiaAI hotfix set stalled on the third sequential
+8K cold request and logged `No available shared memory broadcast block found in
+60 seconds`. It is not the production profile. Removing the scheduler,
+spin-wait, hybrid-cache and optional performance changes while retaining only
+Issue #22 eliminated the stall.
+
+Matched cold-prefix measurements on this two-node cluster were:
+
+| Workload | Regular-Graph FP8 | Issue #22-only NVFP4 |
+| --- | ---: | ---: |
+| C1, 256-token prompt, decode median | 72.3 tok/s | 78.0 tok/s |
+| C1, 8K prompt, decode median | 87.2 tok/s | 79.1 tok/s (10/10 completed) |
+| C6, 256-token prompt, per-stream median | 46.1 tok/s | 43.2 tok/s |
+| C6, 256-token prompt, warm aggregate | 193–203 tok/s | 190–198 tok/s |
+| C6, 8K prompt, warm aggregate | 21.1 tok/s (one trial) | 29.1 tok/s |
+
+The run-to-run spread is larger than the apparent C1 differences, so these data
+do **not** justify a general “NVFP4 is faster” claim. They show comparable decode
+throughput and, more importantly, stable completion under the tested workloads.
+The padded `nvfp4_ds_mla` and `fp8_ds_mla` layouts also consumed essentially the
+same KV memory at `GPU_MEM=0.78` (about 1.4M tokens in the startup log).
+
+MTP-6 was also rejected: C1 p256 fell to `73.2 tok/s`, C6 p256 fell to
+`41.9 tok/s`, and Graph capture grew from about `0.33 GiB` to `1.15 GiB`.
+Its small p8192 gain (`81.9` vs `79.1`) did not offset those regressions. The
+production default remains MTP-5 and a derived capture size of 36.
+
+Long-context/protocol gates on the selected profile:
+
+- 128K C1: 2/2 completed, `74.8s` TTFT, `80.2 tok/s` decode median;
+- 900K C1: completed 128/128 output tokens, `931.0s` TTFT and `73.5 tok/s`
+  decode; running/waiting/KV metrics returned to zero afterward;
+- native Anthropic: 239,869 input tokens across 24 history rounds, including a
+  historical tool result, returned the exact structured tool call in `171.4s`;
+- no DSML/Anthropic XML leakage, shared-memory timeout, NCCL error, or leftover
+  running/waiting request was observed after those gates.
 
 ## Regression probe
 
@@ -133,6 +187,20 @@ longer soak test.
 The same hardware/configuration had separately completed a `999,860`-token FP8
 needle request. That demonstrates capacity for one test prompt; it does not mean
 all 1M workloads have equal quality or latency.
+
+The 2026-08-20 single-user profile additionally completed a native Anthropic
+request with `1,039,984` input tokens. Cold prefill took `1,050.138s` (990
+computed input tok/s), TTFT was `1,052.520s`, and there was no OOM, queue, or
+container restart. Appending one turn produced `1,039,996` input tokens, hit
+`1,039,872` cached tokens, recomputed only 124, and completed in `2.998s`
+server-side (`0.554s` prefill, `2.759s` TTFT). This directly validates both
+near-full-window capacity and prefix-cache reuse for the selected NVFP4 profile.
+
+Prefix caching does not reduce request-body upload. A stateless client still
+retransmits its complete history; on a relayed overlay path, a 1.04 MB history
+added tens of seconds outside the engine despite a greater than 99.9% KV hit.
+Use a direct management/LAN or direct overlay path when interpreting client
+latency.
 
 ## Rollback
 
