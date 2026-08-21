@@ -2,7 +2,7 @@
 # hotfix-nvfp4-ds-mla-issue22.sh — Fix nvfp4_ds_mla long-context decode regression
 #
 # ACTUAL ROOT CAUSE: flashmla_sparse.py dispatches nvfp4_ds_mla to the slow
-# _forward_bf16_kv path instead of the fast _forward_fp8_kv path.  The584-byte
+# _forward_bf16_kv path instead of the fast _forward_fp8_kv path.  The 584-byte
 # KV layout is identical for both dtypes; only the kernel dispatch differs.
 #
 # Usage:
@@ -84,7 +84,7 @@ def patch(path: str, old: str, new: str, label: str) -> None:
 # ============================================================
 # THE FIX: Route nvfp4_ds_mla to the fast FP8 kernel path
 # ============================================================
-# The584-byte KV layout is identical for fp8_ds_mla and nvfp4_ds_mla on DSV4.
+# The 584-byte KV layout is identical for fp8_ds_mla and nvfp4_ds_mla on DSV4.
 # The only difference is the kernel dispatch.  nvfp4_ds_mla was incorrectly
 # routed to the slow _forward_bf16_kv path.
 patch(

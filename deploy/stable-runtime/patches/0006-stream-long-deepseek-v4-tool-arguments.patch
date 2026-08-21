@@ -1,0 +1,138 @@
+# Pinned-base backport of vLLM PR #52865 through 08cbee10.
+# Includes the prerequisite #52846 change, the linear string fast path,
+# schema/open-string gating, JSON escaping, and the local DSML variants.
+diff --git a/vllm/parser/deepseek_v4.py b/vllm/parser/deepseek_v4.py
+index 776b808e..8b950fc2 100644
+--- a/vllm/parser/deepseek_v4.py
++++ b/vllm/parser/deepseek_v4.py
+@@ -290,7 +290,6 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+             ParserState.TOOL_ARGS: EventType.ARG_VALUE_CHUNK,
+         },
+         arg_converter=_dsml_arg_converter,
+-        arg_structural_chars=frozenset(">"),
+         strip_content_whitespace_with_tools=False,
+         tool_args_json=False,
+         malformed_tool_prefixes=(
+@@ -300,6 +299,50 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+     )
+ 
+ 
++_DSML_TAG_PREFIXES = (
++    "<think>",
++    "</think>",
++    DSML_TOOL_START,
++    DSML_TOOL_END,
++    f"<{_DSML}invoke",
++    DSML_INVOKE_END,
++    f"<{_DSML}parameter",
++    DSML_PARAM_CLOSE,
++    DSML_TOOL_START_ASCII,
++    DSML_TOOL_END_ASCII,
++    f"<{_DSML_ASCII}invoke",
++    DSML_INVOKE_END_ASCII,
++    f"<{_DSML_ASCII}parameter",
++    DSML_PARAM_CLOSE_ASCII,
++    DSML_TOOL_END_BARE,
++    DSML_INVOKE_END_BARE,
++    DSML_PARAM_CLOSE_BARE,
++)
++
++
++def _is_open_json_string(json_str: str) -> bool:
++    if not json_str:
++        return False
++    in_string = False
++    escape = False
++    for char in json_str:
++        if escape:
++            escape = False
++        elif char == "\\":
++            escape = True
++        elif char == '"':
++            in_string = not in_string
++    return in_string
++
++
++def _has_pending_tag(text: str) -> bool:
++    last_angle = text.rfind("<")
++    if last_angle == -1:
++        return False
++    tail = text[last_angle:]
++    return any(tag.startswith(tail) for tag in _DSML_TAG_PREFIXES)
++
++
+ class DeepSeekV4Parser(ParserEngine):
+     def __init__(
+         self,
+@@ -342,3 +385,49 @@ class DeepSeekV4Parser(ParserEngine):
+             return result
+         func_name = next((s.name for s in self._tool_slots if s.args == raw_args), None)
+         return _unwrap_wrapper_args(result, self._tools, func_name)
++
++    def _compute_arg_delta(self, idx: int, raw_delta: str) -> str | None:
++        slot = self._tool_slots[idx]
++
++        # Once a schema-stable string value is known to be open, stream each
++        # escaped chunk directly. This keeps large code/file arguments linear
++        # instead of reconverting the complete accumulated DSML on every tick.
++        if (
++            slot.active_string_param is not None
++            and slot.in_open_string
++            and "<" not in raw_delta
++        ):
++            escaped_delta = json.dumps(raw_delta, ensure_ascii=False)[1:-1]
++            slot.streamed_json += escaped_delta
++            return escaped_delta
++
++        diff = super()._compute_arg_delta(idx, raw_delta)
++
++        last_end = 0
++        for match in _PARAM_RE.finditer(slot.args):
++            last_end = match.end()
++        partial_match = _PARTIAL_PARAM_RE.search(slot.args, last_end)
++        if (
++            partial_match
++            and partial_match.group(2) == "true"
++            and not _has_pending_tag(slot.args[partial_match.start(3) :])
++        ):
++            slot.active_string_param = partial_match.group(1)
++            schema_stable = (
++                slot.string_keys is None
++                or slot.active_string_param in slot.string_keys
++            )
++            slot.in_open_string = schema_stable and _is_open_json_string(
++                slot.streamed_json
++            )
++        else:
++            slot.active_string_param = None
++            slot.in_open_string = False
++
++        return diff
++
++    def _flush_arg_converter(self, idx: int) -> str | None:
++        if idx < len(self._tool_slots):
++            self._tool_slots[idx].active_string_param = None
++            self._tool_slots[idx].in_open_string = False
++        return super()._flush_arg_converter(idx)
+diff --git a/vllm/parser/engine/parser_engine.py b/vllm/parser/engine/parser_engine.py
+index 6f21cbca..f3174235 100644
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -54,6 +54,8 @@ class ToolCallSlot:
+         "name_sent",
+         "string_keys",
+         "streamed_json",
++        "active_string_param",
++        "in_open_string",
+     )
+ 
+     def __init__(self) -> None:
+@@ -64,6 +66,8 @@ class ToolCallSlot:
+         self.name_sent: bool = False
+         self.string_keys: set[str] | None = None
+         self.streamed_json: str = ""
++        self.active_string_param: str | None = None
++        self.in_open_string: bool = False
+ 
+     @property
+     def args(self) -> str:

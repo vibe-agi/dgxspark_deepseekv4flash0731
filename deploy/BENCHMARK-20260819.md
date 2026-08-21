@@ -69,6 +69,11 @@ from roughly 0.33 GiB to 1.15 GiB. The small 8K C1 gain did not compensate for
 the other regressions. Production remains MTP-5 with capture size
 `6 × (5 + 1) = 36`.
 
+Later startup-log review showed that this pinned vLLM normalizes a requested
+ceiling of `36` to actual capture sizes ending at `32`. The historical A/B below
+used the requested value shown; it is not evidence that a 36-token full graph
+was captured.
+
 ## Hardware state
 
 During a long prefill both GPUs reported P0, about 96% utilization, CPU governors
@@ -136,6 +141,61 @@ the client wall time was 193.5s versus 140.9s server-side. Its appended turn hit
 99.923% of prompt tokens, yet retransmitting the same JSON history still added
 about 42.7s outside the engine. Prefix caching avoids GPU recomputation; it does
 not stop stateless clients from uploading the complete history every turn.
+
+## 2026-08-21 thinking/API compatibility gate
+
+Overlay `0.1.9-stable-20260821` adds the merged vLLM Model Runner V2
+thinking-budget implementation and a bounded Responses usage-accounting fix.
+The live matrix used one arithmetic answer (`8887500053`) across all three APIs:
+
+| Path | Control | Result |
+| --- | --- | --- |
+| Anthropic Messages | manual `budget_tokens=1024` | PASS in 4.141s; non-empty thinking, exact answer |
+| Anthropic Messages | adaptive + `effort=max` | PASS in 4.821s; non-empty thinking, exact answer |
+| OpenAI Chat | `thinking_token_budget=1024` | PASS in 2.899s; model naturally ended before the cap, exact answer |
+| OpenAI Chat | `reasoning_effort=max` | PASS in 6.094s; non-empty reasoning, exact answer |
+| OpenAI Responses | `reasoning.effort=max` | PASS in 5.818s; 263 output tokens, 257 reported as reasoning, exact answer |
+| All three APIs | streaming | PASS; protocol-native reasoning and completion events |
+| All three APIs | thinking disabled | PASS; no reasoning item/block/field |
+| Chat and Responses | automatic structured tool call | PASS; exact tool and JSON arguments, no DSML/XML leakage |
+
+The first numeric-budget request compiled the new Triton budget kernels once;
+subsequent requests reused them. Three concurrent Chat requests with exact
+32/64/128-token budgets produced 38/70/134 completion tokens respectively: each
+budget plus the same six-token visible answer. The 32- and 64-token answers were
+wrong while 128 was correct, showing both the hard boundary and the quality cost
+of truncating mid-thought. The normal recommendation is protocol effort plus a
+budget of at least 1,024 when a hard cap is needed. OpenAI Responses has no
+separate standard numeric reasoning cap in this profile; `max_output_tokens`
+covers reasoning plus visible output.
+
+## 2026-08-21 `0.1.9` full-window and compaction gate
+
+The final gate used the same reviewed image and the native Anthropic endpoint:
+
+```bash
+python3 probes/anthropic_compaction_round.py \
+  --base-url http://HEAD-CLIENT-IP:8888/v1 \
+  --model deepseek-v4-flash \
+  --target-tokens 1040000 \
+  --turns 96 \
+  --effort max
+```
+
+| Phase | Input | Output | Server elapsed | Result |
+| --- | ---: | ---: | ---: | --- |
+| Full context | 1,040,105 | 85 | 1,127.003s | PASS; structured tool result, no marker leakage |
+| Compaction | 1,040,118 | 381 | 11.293s | PASS; all four anchors retained |
+| Post compact | 658 | 84 | 5.579s | PASS; structured tool call from summary |
+
+The compaction request hit `1,039,872` prefix tokens, recomputed 246, and
+therefore achieved a `99.976349%` prompt-cache hit. The cold full request's
+end-to-end input rate was approximately 923 tok/s; this includes output decode
+and is deliberately not mislabeled as a pure Prefill measurement. The three
+input counts sum exactly to the post-run `prompt_tokens_total` delta, and the
+cache-hit counter delta equals `1,039,872`. The server ended at running 0,
+waiting 0, KV usage 0, and HTTP 200 health, with no ERROR, traceback, exception,
+or NCCL failure in the run log.
 
 ## Current single-user profile
 

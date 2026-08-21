@@ -10,11 +10,11 @@ Run **DeepSeek V4 Flash 0731** with a 1M context limit across **two NVIDIA DGX S
 
 This repository turns the original two-node recipe into a reproducible, long-agent-stable deployment:
 
-- **Long agent histories degrade or leak protocol markup**: the pinned runtime mishandles adjacent assistant text/reasoning/tool-call records, while the model can drift from canonical full-width DSML markers to ASCII or abbreviated closing tags. A thin Docker overlay backports vLLM PR #50686 and makes the DeepSeek-V4 tool parser tolerate those equivalent DSML forms. Both fixes are validated during the image build; model weights are not modified or requantized.
+- **Long native-Anthropic agent histories degrade, leak markup, stop calling tools, or lose thinking controls**: the pinned runtime can encode empty historical thinking blocks, discard Anthropic `thinking`, reject V2 requests that carry `thinking_token_budget`, mishandle adjacent assistant records, delay large tool arguments, expose malformed/missing DSML wrappers or contaminated names, and undercount prompt-opened reasoning in Responses usage. The pinned overlay applies twelve protocol/tokenizer/parser/sampler/mHC fixes with explicit-effort precedence, exact V2 numeric thinking budgets, parser-backed Responses reasoning accounting, declared-tool validation, bounded lossless recovery, and list-backed long-argument streaming. Build-time and live Anthropic/OpenAI gates cover thinking controls, arbitrary stream splits, 1 MiB arguments, full-window tool use, and a client-side compaction round; model weights are not modified or requantized.
 - **Head/Worker containers exit during distributed startup**: the scripts enforce unique ranks, Worker-first startup, dual-HCA RoCE, matching IP/MTU checks, and dynamic IPv4 GID selection instead of a fragile hard-coded GID index.
 - **Setup assumes the operator is root**: `prepare.sh` now runs as an ordinary user and requests targeted `sudo` only for the protected model directory and RoCE configuration; it no longer recursively changes ownership of all `/data`.
-- **NVFP4 and scheduler hotfixes are applied as an untested bundle**: the stable image installs only the Issue #22 fast-kernel route. A full candidate bundle stalled on the third 8K cold request; the isolated image completed 10/10, six-way mixed-prefill tests, 128K requests, and a 239,869-token native Anthropic agent/tool history.
-- **A configured 1M limit is mistaken for proven capacity**: the selected profile completed a native Anthropic request with `1,039,984` input tokens and then appended a turn at `99.9881%` prompt-cache hit. Cold prefill took `1,050.1s`; the cached append completed server-side in `3.0s`. Six active sequences do not mean 6 × 1M KV capacity.
+- **NVFP4 and scheduler hotfixes are applied as an untested bundle**: the stable image keeps only the isolated Issue #22 fast-kernel route; its other changes are individually sourced vLLM Python backports and locally reviewed protocol hardening. A broad candidate bundle stalled on the third 8K cold request, so no unreviewed scheduler/hybrid-cache bundle is shipped.
+- **A configured 1M limit is mistaken for proven capacity**: the reviewed `0.1.9` overlay completed a native Anthropic request with `1,040,105` input tokens (99.1921% of the window), compacted the same full history at a `99.976349%` prompt-cache hit, and completed a post-compaction tool call. The cold full request took `1,127.003s`, the compacting request `11.293s`, and the fresh 658-token post-compact request `5.579s`. Six active sequences do not mean 6 × 1M KV capacity.
 - **A warm server can still feel slow remotely**: prefix caching removes repeated GPU prefill, but a stateless client still uploads the full JSON history on every turn. A relayed overlay-network control added `42.7s` outside the engine for a repeated 1.04 MB history; prefer a direct LAN/overlay path and distinguish client wall time from server TTFT.
 - **Client and cluster addresses are confused**: OpenAI-compatible and Anthropic-compatible clients use the Head management/LAN endpoint, while the example `10.10.12.0/24` and `10.10.13.0/24` networks remain dedicated to Head/Worker RoCE traffic.
 
@@ -22,8 +22,10 @@ In short: it fixes both sides of long-session protocol failure (history encoding
 
 The dated A/B matrix and rejection evidence are in
 [`deploy/BENCHMARK-20260819.md`](deploy/BENCHMARK-20260819.md).
+The whole-patch quality review is in
+[`deploy/stable-runtime/PATCH_REVIEW.md`](deploy/stable-runtime/PATCH_REVIEW.md).
 
-**中文摘要：**本项目修复了长 Agent 多轮后的协议标签泄露/胡言乱语，解决双机 NCCL/GID/启动顺序导致的容器退出，将 root 视角的准备脚本改为普通用户可用，并通过逐补丁 A/B 收敛到 Issue #22-only 的 NVFP4 稳定配置；已验证 24 万 token 原生 Anthropic 工具历史和 6 路并发，不会把整套实验补丁直接装进生产镜像。
+**中文摘要：**本项目修复长 Agent 多轮后的空 thinking、Anthropic thinking 字段被吞、V2 budget 请求 500、Responses reasoning 计数为 0、协议标签泄露、工具 wrapper/name 污染、长参数迟迟不调用，以及首次请求 mHC JIT 卡顿；原生支持 `/v1/messages`，不再需要 UniClaudeProxy，同时保留 OpenAI Chat/Responses 的原生 thinking 控制。Anthropic/Chat 数值预算已在 V2 sampler 精确执行，所有运行时 patch 都固定基线、`--fuzz=0` 构建并接受整体质量审查。
 
 完整 A/B 矩阵与淘汰依据见
 [`deploy/BENCHMARK-20260819.md`](deploy/BENCHMARK-20260819.md)。
@@ -59,7 +61,7 @@ dgxspark_deepseekv4flash0731/
 │   ├── prepare.sh           #    Environment setup (interactive menu)
 │   ├── start-head.sh        #    Head node startup script
 │   ├── start-worker.sh      #    Worker node startup script
-│   ├── stable-runtime/      #    Tokenizer/DSML + isolated NVFP4 Issue #22 overlay
+│   ├── stable-runtime/      #    Native-Anthropic tokenizer/DSML/mHC + NVFP4 overlay
 │   ├── stability-probe.py   #    Multi-turn / long-context regression
 │   ├── STABILITY.md         #    Root cause, validation, rollback
 │   └── README.md            #    Detailed deployment guide
@@ -83,7 +85,7 @@ dgxspark_deepseekv4flash0731/
 
 | Item | Details |
 |------|---------|
-| Base Image | `ghcr.nju.edu.cn/anemll/dspark-vllm-gx10:0.1.1`; `prepare.sh --image` builds the stable overlay |
+| Base Image | digest-pinned Anemll `dspark-vllm-gx10:0.1.1`; `prepare.sh --image` builds overlay `0.1.9-stable-20260821` |
 | Model Weights | `DeepSeek-V4-Flash-0731` full directory, same path on both nodes |
 | OS | DGX Spark (NVIDIA GB10, 128GB), Ubuntu 24.04+, with NVIDIA drivers/docker/nvidia-container-toolkit |
 
@@ -216,6 +218,32 @@ curl -s "${ANTHROPIC_BASE_URL}/v1/messages" \
   }' | python3 -m json.tool
 ```
 
+#### 5.4.1 Thinking controls
+
+The stable overlay accepts the native control used by each protocol. Explicit
+effort always wins over a compatibility fallback:
+
+| API | Request control | Behavior on this DeepSeek/DSpark profile |
+| --- | --- | --- |
+| Anthropic Messages | `"thinking":{"type":"adaptive"}` plus `"output_config":{"effort":"max"}` | Native and recommended; maps to DeepSeek `max` |
+| Anthropic Messages | `"thinking":{"type":"enabled","budget_tokens":N}` | Exact reasoning-token budget on Model Runner V2; neutral `high` prompt when effort is absent |
+| OpenAI Chat Completions | `"reasoning_effort":"max"` | Native and recommended; maps to DeepSeek `max` |
+| OpenAI Responses | `"reasoning":{"effort":"max"}` | Native and recommended; maps to DeepSeek `max` |
+| OpenAI Chat extension | `"thinking_token_budget":N` | Exact reasoning-token budget on Model Runner V2; neutral `high` prompt when effort is absent |
+
+Patch `0011` backports vLLM's Model Runner V2 thinking-budget sampler, so the
+Anthropic and Chat numeric forms are hard reasoning-token boundaries rather
+than approximations. Very small values can force a mid-thought transition and
+reduce answer/tool quality; use at least `1024` unless truncation is the goal.
+OpenAI Responses has no standard reasoning-only numeric budget here: use
+`reasoning.effort`, while `max_output_tokens` limits reasoning plus visible
+output. Patch `0012` also makes Responses `reasoning_tokens` account for the
+DeepSeek template's prompt-opened `<think>` span.
+
+The live `/openapi.json` advertises all of these controls: Chat exposes
+`reasoning_effort`/`thinking_token_budget`, Responses exposes `reasoning`, and
+Anthropic Messages/count-tokens expose `thinking`/`output_config`.
+
 #### 5.5 Throughput Benchmark
 
 ```bash
@@ -298,8 +326,9 @@ GB10 provides 128 GB unified memory per node. Observed model loading used about 
 | Code generation (500 tokens) | **~61 tok/s** | ~960ms | 79 GB/node |
 | Long text generation (500 tokens) | ~45 tok/s | ~1s | 79 GB/node |
 | 88K cold prefill (single-user lane) | **2,075 input tok/s** | 42.43s | 0.835 budget |
-| 1,039,984-token cold prefill | **990 input tok/s** | 1,052.52s | full-window gate |
-| 1,039,996-token cached append | 99.9881% cache hit | 2.759s | 3.0s server e2e |
+| 1,040,105-token cold full request | **923 input tok/s** | 1,127.003s e2e | `0.1.9` full-window gate |
+| 1,040,118-token compact request | 99.976349% cache hit | 11.293s e2e | only 246 tokens recomputed |
+| 658-token post-compact request | structured tool call | 5.579s e2e | all four anchors retained |
 
 ---
 
@@ -311,7 +340,7 @@ Model natively supports 1M token context (`max_position_embeddings: 1048576` in 
 
 ### GPU Memory: `--gpu-memory-utilization 0.835`
 
-**This is a safety ceiling, not process RSS.** Unified memory, CUDA graphs, JIT workspaces, and host caches all consume the same pool. The 0.835 single-user profile completed a 1,039,984-token request. It is paired with the 16K prefill batch; at 0.78 that batch left only 8.22 GiB KV versus 10.91 GiB required for 1M.
+**This is a safety ceiling, not process RSS.** Unified memory, CUDA graphs, JIT workspaces, and host caches all consume the same pool. The reviewed 0.835 single-user profile completed a 1,040,105-token request on `0.1.9`. It is paired with the 16K prefill batch; at 0.78 that batch left only 8.22 GiB KV versus 10.91 GiB required for 1M.
 
 | Value | Effect |
 |-------|--------|
@@ -486,7 +515,7 @@ MIT
 
 # DGX Spark 双机部署 DeepSeek V4 Flash 0731
 
-两台 NVIDIA DGX Spark（GB10，每节点 128 GB 统一内存）通过双路 RoCE 互联，运行 **DeepSeek V4 Flash 0731**。当前单用户满窗配置使用 padded NVFP4 DS-MLA KV、1M 上限，以及可复现的 tokenizer、DSML parser 和 Issue #22 内核路由补丁。
+两台 NVIDIA DGX Spark（GB10，每节点 128 GB 统一内存）通过双路 RoCE 互联，运行 **DeepSeek V4 Flash 0731**。当前单用户满窗配置使用 padded NVFP4 DS-MLA KV、1M 上限、原生 Anthropic API，以及可复现的 tokenizer、DSML parser、mHC warmup 和 Issue #22 内核路由补丁。
 
 > 🇬🇧 English version above | GitHub：[github.com/vibe-agi/dgxspark_deepseekv4flash0731](https://github.com/vibe-agi/dgxspark_deepseekv4flash0731)
 
@@ -520,7 +549,7 @@ dgxspark_deepseekv4flash0731/
 │   ├── prepare.sh           #    环境准备脚本 (交互式菜单)
 │   ├── start-head.sh        #    Head 节点启动脚本
 │   ├── start-worker.sh      #    Worker 节点启动脚本
-│   ├── stable-runtime/      #    tokenizer/DSML + NVFP4 Issue #22 稳定薄层
+│   ├── stable-runtime/      #    原生 Anthropic tokenizer/DSML/mHC + NVFP4 稳定薄层
 │   ├── stability-probe.py   #    多轮/长上下文回归
 │   ├── STABILITY.md         #    根因、验证、回滚
 │   └── README.md            #    详细部署说明书
@@ -544,7 +573,7 @@ dgxspark_deepseekv4flash0731/
 
 | 项目 | 说明 |
 |------|------|
-| 基础镜像 | `ghcr.nju.edu.cn/anemll/dspark-vllm-gx10:0.1.1`；`prepare.sh --image` 构建稳定薄层 |
+| 基础镜像 | digest 固定的 Anemll `dspark-vllm-gx10:0.1.1`；`prepare.sh --image` 构建 `0.1.9-stable-20260821` |
 | 模型权重 | `DeepSeek-V4-Flash-0731` 完整目录，两台节点同一路径 |
 | 系统 | DGX Spark (NVIDIA GB10, 128GB 统一内存), Ubuntu 24.04+, 自带驱动/docker/nvidia-container-toolkit |
 
@@ -668,6 +697,30 @@ curl -s "${ANTHROPIC_BASE_URL}/v1/messages" \
   }' | python3 -m json.tool
 ```
 
+#### 5.4.1 Thinking 参数兼容
+
+稳定薄层接受各协议的原生字段；客户端显式指定的 effort 始终优先：
+
+| API | 请求字段 | 当前 DeepSeek/DSpark 配置中的行为 |
+| --- | --- | --- |
+| Anthropic Messages | `"thinking":{"type":"adaptive"}` + `"output_config":{"effort":"max"}` | 原生且推荐，映射为 DeepSeek `max` |
+| Anthropic Messages | `"thinking":{"type":"enabled","budget_tokens":N}` | V2 下精确限制 reasoning token；未给 effort 时用中性的 `high` prompt |
+| OpenAI Chat Completions | `"reasoning_effort":"max"` | 原生且推荐，映射为 DeepSeek `max` |
+| OpenAI Responses | `"reasoning":{"effort":"max"}` | 原生且推荐，映射为 DeepSeek `max` |
+| OpenAI Chat 扩展 | `"thinking_token_budget":N` | V2 下精确限制 reasoning token；未给 effort 时用中性的 `high` prompt |
+
+补丁 `0011` 将 vLLM 的 V2 thinking-budget sampler 回移到固定基线，Anthropic
+和 Chat 的数值字段现在会在 reasoning 的第 N 个 token 处强制转换，不再是近似。
+预算过小会把推理截断并降低答案或工具调用质量，非刻意截断时建议至少 `1024`。
+OpenAI Responses 在这里没有标准的 reasoning-only 数值预算：使用
+`reasoning.effort`，而 `max_output_tokens` 同时限制 reasoning 与可见输出。补丁
+`0012` 还修正了 DeepSeek prompt 已打开 `<think>` 时 Responses 的
+`reasoning_tokens` 计数。
+
+服务的 `/openapi.json` 也明确公开这些字段：Chat 有
+`reasoning_effort`/`thinking_token_budget`，Responses 有 `reasoning`，Anthropic
+Messages/count-tokens 有 `thinking`/`output_config`。
+
 #### 5.5 吞吐基准
 
 ```bash
@@ -734,8 +787,9 @@ GB10 每节点有 128 GB 统一内存。实测模型加载约占 79 GiB/节点�
 | 代码生成 (500 tokens) | **~61 tok/s** | ~960ms | 79 GB/节点 |
 | 长文本生成 (500 tokens) | ~45 tok/s | ~1s | 79 GB/节点 |
 | 88K 冷 Prefill（单用户档） | **2,075 input tok/s** | 42.43s | 0.835 预算 |
-| 1,039,984-token 冷 Prefill | **990 input tok/s** | 1,052.52s | 满窗验证 |
-| 1,039,996-token 缓存追加 | 99.9881% 命中 | 2.759s | 服务端总计 3.0s |
+| 1,040,105-token 冷满窗请求 | **923 input tok/s** | 服务端总计 1,127.003s | `0.1.9` 满窗验证 |
+| 1,040,118-token compact 请求 | 99.976349% 命中 | 服务端总计 11.293s | 只重算 246 token |
+| 658-token compact 后请求 | 结构化工具调用 | 服务端总计 5.579s | 四个埋点全部保留 |
 
 Prefix Cache 只避免 DGX 重算，不会阻止无状态客户端每轮重新上传完整历史。一次 1.04 MB、250K-token 请求经中继型覆盖网络时，客户端比服务端额外等待约 52.7 秒；缓存追加轮仍有约 42.7 秒花在引擎之外。远程使用应优先让 Tailscale/覆盖网络建立直连，并分别观察客户端 wall time 与服务端 TTFT。
 
@@ -749,7 +803,7 @@ Prefix Cache 只避免 DGX 重算，不会阻止无状态客户端每轮重新�
 
 ### 显存管理：`--gpu-memory-utilization 0.835`
 
-**这是安全上限，不是实际占用。** 统一内存还要容纳 CUDA Graph、JIT workspace 和系统缓存。0.835 单用户档已实际完成 `1,039,984`-token 请求；它必须和 16K prefill batch 配套。16K batch 在 0.78 下只剩 8.22 GiB KV，低于 1M 所需的 10.91 GiB，vLLM 会拒绝启动。
+**这是安全上限，不是实际占用。** 统一内存还要容纳 CUDA Graph、JIT workspace 和系统缓存。审查后的 0.835 单用户档已在 `0.1.9` 实际完成 `1,040,105`-token 请求；它必须和 16K prefill batch 配套。16K batch 在 0.78 下只剩 8.22 GiB KV，低于 1M 所需的 10.91 GiB，vLLM 会拒绝启动。
 
 | 值 | 效果 |
 |------|------|

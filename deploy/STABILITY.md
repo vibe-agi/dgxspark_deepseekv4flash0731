@@ -1,9 +1,10 @@
 # Long-agent stability profile
 
 This profile targets long, tool-heavy agent sessions on two DGX Spark nodes. It
-keeps the 1M model limit, padded NVFP4 DS-MLA KV cache, prefix caching, chunked prefill, and
-DSpark speculative decoding while removing two failure modes seen in long,
-tool-heavy OpenAI-compatible histories.
+keeps the 1M model limit, padded NVFP4 DS-MLA KV cache, prefix caching, chunked
+prefill, and DSpark speculative decoding while removing the tokenizer, parser,
+streaming, and cold-JIT failure modes reproduced in long native-Anthropic agent
+histories.
 
 ## Why short chats can pass while long agents fail
 
@@ -15,18 +16,38 @@ those records independently and can accumulate malformed reasoning/EOS boundarie
 over many tool rounds. The eventual symptoms include repeated actions, leaked
 protocol markup, and nonsensical output even though the KV cache is not full.
 
-There is a second, independent producer-side failure. DeepSeek V4 normally emits
+Empty historical reasoning introduces another failure: tool-enabled prompt
+encoding can turn an assistant record with no replayable reasoning into repeated
+`<think></think>` blocks. At long context, those blocks bias the next turn toward
+an immediate thinking close and little or no useful reasoning.
+
+There is also an independent producer-side failure. DeepSeek V4 normally emits
 tool calls with full-width `<｜DSML｜...>` markers, but long agent runs can drift
 to semantically equivalent ASCII `<|DSML|...>` markers or abbreviated closing
-tags such as `</parameter>`. The pinned vLLM parser recognizes only the canonical
-spelling, so valid tool syntax is returned to the client as visible assistant
-text.
+tags such as `</parameter>`, omit/corrupt the outer wrapper, or place a truncated
+marker in the following tool name. The pinned parser recognizes only the ideal
+form, so syntax can leak into text or the client receives an invalid tool name.
+Large string arguments also used a repeated whole-buffer conversion path, which
+can appear as “says it will call Bash, but never acts.”
 
-The thin image in `stable-runtime/` applies the upstream tokenizer fix, a small
-tolerant-parser patch, and only the MiaAI Issue #22 NVFP4 kernel-dispatch fix to
-the pinned base image. Its build-time verifier checks canonical DSML, ASCII
-DSML, abbreviated closing tags, consecutive assistant-history merging, and the
-NVFP4 fast-path marker. It does not change or requantize model weights.
+The thin image in `stable-runtime/` pins the base digest and vLLM commit, applies
+twelve exact (`--fuzz=0`) protocol/tokenizer/parser/sampler/mHC patches, and retains only the MiaAI
+Issue #22 NVFP4 kernel-dispatch change from that external bundle. The parser
+recovery path is provisional, lossless on failure, bounded, and allow-listed by
+the tools declared in the current request. Build-time verification covers every
+character boundary of canonical/recovered calls, contaminated/undeclared names,
+1 MiB multiline/control-character arguments, mHC dispatch, empty thinking,
+and the NVFP4 marker. See `stable-runtime/PATCH_REVIEW.md`. Model weights are not
+changed or requantized.
+
+The pinned native Anthropic endpoint also accepted but silently discarded the
+top-level `thinking` request object. Passing the corresponding
+`thinking_token_budget` farther into DSpark's mandatory Model Runner V2 instead
+produced HTTP 500. Patch `0010` parses the Anthropic controls and preserves
+explicit effort. Patch `0011` backports vLLM's merged V2 sampler implementation,
+which tracks each request's reasoning state and enforces the exact numeric cap.
+Patch `0012` counts reasoning that starts in the prompt template, fixing zero
+`reasoning_tokens` usage on OpenAI Responses.
 
 The tracked single-user/full-window profile also uses:
 
@@ -71,12 +92,24 @@ Or build the overlay directly:
 
 ```bash
 cd deploy/stable-runtime
-BASE_IMAGE=ghcr.nju.edu.cn/anemll/dspark-vllm-gx10:0.1.1 \
-IMAGE=deepseek-v4-flash:0.1.1-stable-nvfp4-20260819 \
+IMAGE=deepseek-v4-flash:0.1.9-stable-20260821 \
 ./build.sh
 ```
 
 Both nodes must use images built from the same base image and patch.
+The build script supplies the digest-pinned base by default; do not replace it
+with the mutable `:0.1.1` tag in a reproducible build.
+
+The runtime exposes native `/v1/messages` and `/v1/messages/count_tokens`.
+Claude Code can connect directly to the Head management/LAN/VPN endpoint; an
+Anthropic-to-OpenAI conversion proxy is not part of this stability path.
+
+For thinking depth, prefer Anthropic `output_config.effort`, OpenAI Chat
+`reasoning_effort`, or OpenAI Responses `reasoning.effort`. Anthropic
+`budget_tokens` and the vLLM Chat extension `thinking_token_budget` are exact
+reasoning cutoffs on this patched V2 profile. OpenAI Responses exposes effort,
+not a standard reasoning-only numeric cap; its `max_output_tokens` covers both
+reasoning and visible output.
 
 ## Launch
 
@@ -126,7 +159,10 @@ same KV memory at `GPU_MEM=0.78` (about 1.4M tokens in the startup log).
 MTP-6 was also rejected: C1 p256 fell to `73.2 tok/s`, C6 p256 fell to
 `41.9 tok/s`, and Graph capture grew from about `0.33 GiB` to `1.15 GiB`.
 Its small p8192 gain (`81.9` vs `79.1`) did not offset those regressions. The
-production default remains MTP-5 and a derived capture size of 36.
+production default remains MTP-5 and requests a derived capture ceiling of 36.
+The pinned vLLM normalizes that request to a largest full-graph shape of 32;
+single-sequence MTP-5 decode remains covered, while the six-way lane requires a
+separate `40`-ceiling memory/throughput A/B before changing the stable profile.
 
 Long-context/protocol gates on the selected profile:
 
@@ -139,6 +175,25 @@ Long-context/protocol gates on the selected profile:
   running/waiting request was observed after those gates.
 
 ## Regression probe
+
+Use the native Anthropic gates for the patched protocol path:
+
+```bash
+python3 stable-runtime/probes/anthropic_long_agent.py \
+  --base-url http://HEAD-CLIENT-IP:8888/v1 \
+  --target-tokens 32000 \
+  --effort max
+
+python3 stable-runtime/probes/anthropic_compaction_round.py \
+  --base-url http://HEAD-CLIENT-IP:8888/v1 \
+  --target-tokens 1040000 \
+  --turns 96 \
+  --effort max
+```
+
+The second command verifies a full-context tool call, a client-owned compaction
+summary with durable anchors, and a post-compaction tool call. It is not a claim
+that vLLM itself decides when to compact.
 
 The included probe covers Responses API, split assistant/tool history, serial
 replay, and concurrent submissions:
@@ -188,13 +243,15 @@ The same hardware/configuration had separately completed a `999,860`-token FP8
 needle request. That demonstrates capacity for one test prompt; it does not mean
 all 1M workloads have equal quality or latency.
 
-The 2026-08-20 single-user profile additionally completed a native Anthropic
-request with `1,039,984` input tokens. Cold prefill took `1,050.138s` (990
-computed input tok/s), TTFT was `1,052.520s`, and there was no OOM, queue, or
-container restart. Appending one turn produced `1,039,996` input tokens, hit
-`1,039,872` cached tokens, recomputed only 124, and completed in `2.998s`
-server-side (`0.554s` prefill, `2.759s` TTFT). This directly validates both
-near-full-window capacity and prefix-cache reuse for the selected NVFP4 profile.
+The final 2026-08-21 gate ran on the reviewed `0.1.9` overlay. A native
+Anthropic request with `1,040,105` input tokens completed in `1,127.003s`
+without OOM, queueing, or container restart. The compaction request then
+replayed `1,040,118` input tokens, hit `1,039,872`, recomputed only 246
+(`99.976349%` hit), preserved all four anchors, and completed in `11.293s`.
+After the client replaced its transcript with the summary, a 658-token request
+completed a valid structured tool call in `5.579s`. This directly validates
+near-full-window capacity, prefix-cache reuse, client-side compaction, and the
+post-compaction tool path for the selected NVFP4 profile.
 
 Prefix caching does not reduce request-body upload. A stateless client still
 retransmits its complete history; on a relayed overlay path, a 1.04 MB history

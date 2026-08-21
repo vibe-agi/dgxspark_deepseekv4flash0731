@@ -1,23 +1,24 @@
 # Vendored DSpark hotfix provenance
 
-The Issue #22 script is copied without local edits from:
+The Issue #22 script originates from:
 
-- repository: `MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark`
-- commit: `8997d41746e5e1441c15b5e188e6922d1d7bf233`
-- captured: 2026-08-19
+- repository: `MiaAI-Lab/DeepSeek-v4-Flash-DSpark-2x-DGX-Spark`;
+- commit: `8997d41746e5e1441c15b5e188e6922d1d7bf233`;
+- captured: 2026-08-19.
 
-The upstream candidate set was audited, but this repository deliberately
-vendors and applies **only** `hotfix-nvfp4-ds-mla-issue22.sh`. That is the one runtime change required to
-route padded `nvfp4_ds_mla` through the working fast MLA kernel in the pinned
-Anemll `0.1.1` image.
+The executable change remains the upstream Issue #22 change: route padded
+`nvfp4_ds_mla` through the validated fast MLA kernel in the pinned Anemll base.
+This repository corrected only the prose typo `The584-byte` to `The 584-byte`;
+no command or replacement expression was altered.
 
-The scheduler, hybrid-prefix-cache, spin-wait, tool-truncation and performance
-scripts are not shipped. A
-2026-08-19 dual-Spark A/B of the whole set stalled on the third sequential 8K
-cold request and logged a shared-memory broadcast timeout. The isolated Issue
-#22 image completed ten such requests, six-way mixed prefill/decode, and the
-long-agent protocol gate. Do not batch-apply the other scripts without a fresh,
-one-change-at-a-time validation.
+The scheduler, hybrid-prefix-cache, spin-wait, tool-truncation, and broad
+performance scripts are not included. A 2026-08-19 dual-Spark A/B of the whole
+candidate set stalled on the third sequential 8K cold request and logged a
+shared-memory broadcast timeout. The isolated Issue #22 route completed ten
+such requests, a six-way mixed prefill/decode gate, and long-agent protocol
+tests. Any additional upstream script must therefore be introduced and tested
+one change at a time.
 
-When refreshing Issue #22, pin one upstream commit, rebuild both nodes, and
-rerun the throughput, long-context, concurrency and tool-protocol gates.
+When refreshing Issue #22, pin a new upstream commit, rebuild both nodes, compare
+the patched-file hashes, and rerun throughput, long-context, concurrency, and
+tool-protocol gates.

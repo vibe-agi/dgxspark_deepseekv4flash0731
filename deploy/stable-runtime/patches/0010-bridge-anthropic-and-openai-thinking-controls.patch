@@ -1,0 +1,129 @@
+# Local compatibility fix for vLLM's native Anthropic endpoint and the
+# OpenAI-compatible thinking-token extension.  Upstream tracking:
+# https://github.com/vllm-project/vllm/issues/29915
+diff --git a/vllm/entrypoints/anthropic/protocol.py b/vllm/entrypoints/anthropic/protocol.py
+--- a/vllm/entrypoints/anthropic/protocol.py
++++ b/vllm/entrypoints/anthropic/protocol.py
+@@ -115,6 +115,23 @@ class AnthropicOutputConfig(BaseModel):
+     format: AnthropicJsonOutputFormat | None = None
+ 
+ 
++class AnthropicThinkingConfig(BaseModel):
++    """Anthropic manual/adaptive thinking request configuration."""
++
++    type: Literal["enabled", "adaptive", "disabled"]
++    budget_tokens: int | None = Field(default=None, ge=0)
++
++    @model_validator(mode="after")
++    def validate_budget(self) -> "AnthropicThinkingConfig":
++        if self.type == "enabled" and (
++            self.budget_tokens is None or self.budget_tokens == 0
++        ):
++            raise ValueError(
++                "thinking.budget_tokens must be positive when type is 'enabled'"
++            )
++        return self
++
++
+ class AnthropicMessagesRequest(BaseModel):
+     """Anthropic Messages API request"""
+ 
+@@ -127,6 +144,7 @@ class AnthropicMessagesRequest(BaseModel):
+     stream: bool | None = False
+     system: str | list[AnthropicContentBlock] | None = None
+     temperature: float | None = None
++    thinking: AnthropicThinkingConfig | None = None
+     tool_choice: AnthropicToolChoice | None = None
+     tools: list[AnthropicTool] | None = None
+     top_k: int | None = None
+@@ -235,7 +253,9 @@ class AnthropicCountTokensRequest(BaseModel):
+ 
+     model: str
+     messages: list[AnthropicMessage]
++    output_config: AnthropicOutputConfig | None = None
+     system: str | list[AnthropicContentBlock] | None = None
++    thinking: AnthropicThinkingConfig | None = None
+     tool_choice: AnthropicToolChoice | None = None
+     tools: list[AnthropicTool] | None = None
+ 
+diff --git a/vllm/entrypoints/anthropic/serving.py b/vllm/entrypoints/anthropic/serving.py
+--- a/vllm/entrypoints/anthropic/serving.py
++++ b/vllm/entrypoints/anthropic/serving.py
+@@ -501,10 +501,13 @@ class AnthropicServingMessages(OpenAIServingChat):
+         anthropic_request: AnthropicMessagesRequest | AnthropicCountTokensRequest,
+     ) -> None:
+         """Handle output configuration such as output format and effort"""
+-        if isinstance(anthropic_request, AnthropicCountTokensRequest):
+-            return
+         output_config: AnthropicOutputConfig | None = anthropic_request.output_config
+-        if output_config and output_config.format and output_config.format.json_schema:
++        if (
++            not isinstance(anthropic_request, AnthropicCountTokensRequest)
++            and output_config
++            and output_config.format
++            and output_config.format.json_schema
++        ):
+             req.response_format = ResponseFormat(
+                 type=output_config.format.type,
+                 json_schema=JsonSchemaResponseFormat(
+@@ -512,6 +515,23 @@ class AnthropicServingMessages(OpenAIServingChat):
+                     name=output_config.format.type,
+                 ),
+             )
++
++        thinking = anthropic_request.thinking
++        if thinking is not None:
++            if thinking.type == "disabled":
++                implied_effort = "none"
++                if not (output_config and output_config.effort is not None):
++                    req.thinking_token_budget = 0
++            else:
++                # A token budget is a cap, not a quality level.  ``high`` is
++                # therefore the neutral fallback that activates DeepSeek V4's
++                # thinking template.  Explicit output_config.effort below wins.
++                implied_effort = "high"
++                if thinking.type == "enabled":
++                    req.thinking_token_budget = thinking.budget_tokens
++            if req.reasoning_effort is None:
++                req.reasoning_effort = implied_effort
++
+         if output_config and output_config.effort is not None:
+             req.reasoning_effort = output_config.effort
+ 
+diff --git a/vllm/entrypoints/openai/chat_completion/protocol.py b/vllm/entrypoints/openai/chat_completion/protocol.py
+--- a/vllm/entrypoints/openai/chat_completion/protocol.py
++++ b/vllm/entrypoints/openai/chat_completion/protocol.py
+@@ -459,6 +459,33 @@ class ChatCompletionRequest(OpenAIBaseModel):
+ 
+     # --8<-- [end:chat-completion-extra-params]
+ 
++    @model_validator(mode="before")
++    @classmethod
++    def _activate_reasoning_for_thinking_budget(cls, data: Any) -> Any:
++        """Make the vLLM thinking-budget extension enable thinking.
++
++        ``thinking_token_budget`` limits an already-open reasoning block; it
++        does not select a reasoning-effort prompt.  DeepSeek V4 requires the
++        latter to enter thinking mode, so use the neutral ``high`` prompt when
++        a budget is supplied without an explicit effort.  Keep the exact
++        budget for runners that enforce it, and let an explicit effort win.
++        """
++        if not isinstance(data, dict) or data.get("reasoning_effort") is not None:
++            return data
++        if "thinking_token_budget" not in data:
++            return data
++
++        budget = data.get("thinking_token_budget")
++        if isinstance(budget, bool) or not isinstance(budget, int):
++            return data  # The field validator will report the invalid value.
++
++        data = dict(data)
++        if budget == 0:
++            data["reasoning_effort"] = "none"
++        elif budget == -1 or budget > 0:
++            data["reasoning_effort"] = "high"
++        return data
++
+     @model_validator(mode="before")
+     @classmethod
+     def _normalize_messages_before(cls, data: Any) -> Any:

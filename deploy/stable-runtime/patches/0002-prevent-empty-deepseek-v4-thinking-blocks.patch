@@ -1,0 +1,65 @@
+diff --git a/vllm/tokenizers/deepseek_v4_encoding.py b/vllm/tokenizers/deepseek_v4_encoding.py
+index ff29394b8..2bc81db1a 100644
+--- a/vllm/tokenizers/deepseek_v4_encoding.py
++++ b/vllm/tokenizers/deepseek_v4_encoding.py
+@@ -226,6 +226,26 @@ def find_last_user_index(messages: List[Dict[str, Any]]) -> int:
+ # Message Rendering
+ # ============================================================
+ 
++def opens_thinking_block(
++    index: int,
++    messages: List[Dict[str, Any]],
++    thinking_mode: str,
++    drop_thinking: bool,
++    last_user_idx: int,
++) -> bool:
++    """Return whether an assistant turn opens a real thinking block."""
++    if thinking_mode != "thinking":
++        return False
++    msg = messages[index] if 0 <= index < len(messages) else None
++    if msg is None or msg.get("role") != "assistant":
++        return True
++    if index - 1 >= 0 and messages[index - 1].get("task") is not None:
++        return False
++    if drop_thinking and index <= last_user_idx:
++        return False
++    return bool(msg.get("reasoning"))
++
++
+ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: str, drop_thinking: bool = True, reasoning_effort: Optional[str] = None) -> str:
+     """
+     Render a single message at the given index into its encoded string form.
+@@ -347,9 +367,19 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
+         # Check if previous message has a task - if so, this is a task output (no thinking)
+         prev_has_task = index - 1 >= 0 and messages[index - 1].get("task") is not None
+ 
++        opened_by_prev = (
++            index - 1 >= 0
++            and messages[index - 1].get("role") in ["user", "developer"]
++            and opens_thinking_block(
++                index, messages, thinking_mode, drop_thinking, last_user_idx
++            )
++        )
+         if thinking_mode == "thinking" and not prev_has_task:
+             if not drop_thinking or index > last_user_idx:
+-                thinking_part = thinking_template.format(reasoning=reasoning) + thinking_end_token
++                if opened_by_prev or reasoning:
++                    thinking_part = thinking_template.format(reasoning=reasoning) + thinking_end_token
++                else:
++                    thinking_part = ""
+             else:
+                 thinking_part = ""
+ 
+@@ -390,9 +420,9 @@ def render_message(index: int, messages: List[Dict[str, Any]], thinking_mode: st
+     elif messages[index].get("role") in ["user", "developer"]:
+         # Normal generation: append Assistant + thinking token
+         prompt += ASSISTANT_SP_TOKEN
+-        if not drop_thinking and thinking_mode == "thinking":
+-            prompt += thinking_start_token
+-        elif drop_thinking and thinking_mode == "thinking" and index >= last_user_idx:
++        if opens_thinking_block(
++            index + 1, messages, thinking_mode, drop_thinking, last_user_idx
++        ):
+             prompt += thinking_start_token
+         else:
+             prompt += thinking_end_token

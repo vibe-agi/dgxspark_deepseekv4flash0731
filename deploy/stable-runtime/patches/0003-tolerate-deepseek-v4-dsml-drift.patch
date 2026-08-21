@@ -1,5 +1,7 @@
+# Local compatibility patch for the pinned Anemll vLLM baseline.
+# Generated against the exact post-0002 source so --fuzz=0 is reproducible.
 diff --git a/vllm/parser/deepseek_v4.py b/vllm/parser/deepseek_v4.py
-index b47d1ec1..f3ca5fe7 100644
+index c6566870..753539df 100644
 --- a/vllm/parser/deepseek_v4.py
 +++ b/vllm/parser/deepseek_v4.py
 @@ -39,6 +39,7 @@ if TYPE_CHECKING:
@@ -55,7 +57,7 @@ index b47d1ec1..f3ca5fe7 100644
          },
          token_id_terminals={
              "THINK_START": DSML_THINK_START,
-@@ -169,10 +187,22 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+@@ -170,10 +190,22 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                  ParserState.TOOL_PREAMBLE,
                  (),
              ),
@@ -78,7 +80,7 @@ index b47d1ec1..f3ca5fe7 100644
              (ParserState.TOOL_NAME, "INVOKE_NAME_END"): Transition(
                  ParserState.TOOL_ARGS,
                  (),
-@@ -186,15 +216,43 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+@@ -186,15 +218,43 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
                  ParserState.CONTENT,
                  (EventType.TOOL_CALL_END,),
              ),
@@ -121,3 +123,4 @@ index b47d1ec1..f3ca5fe7 100644
 +            ),
          },
          content_events={
+             ParserState.CONTENT: EventType.TEXT_CHUNK,

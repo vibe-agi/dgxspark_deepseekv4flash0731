@@ -98,6 +98,11 @@ def main() -> None:
     parser.add_argument("--target-tokens", type=int, default=240_000)
     parser.add_argument("--turns", type=int, default=24)
     parser.add_argument("--marker", default="LONG-AGENT-TOOL-OK")
+    parser.add_argument(
+        "--effort",
+        choices=("low", "medium", "high", "xhigh", "max"),
+        default="max",
+    )
     args = parser.parse_args()
 
     repeats = max(1, args.target_tokens // (args.turns * 12))
@@ -117,6 +122,7 @@ def main() -> None:
         "model": args.model,
         "max_tokens": 128,
         "temperature": 0,
+        "output_config": {"effort": args.effort},
         "tools": [TOOL],
         "tool_choice": {"type": "tool", "name": "echo_probe"},
         "messages": messages,
@@ -140,6 +146,7 @@ def main() -> None:
                 "input_tokens": response["usage"]["input_tokens"],
                 "output_tokens": response["usage"]["output_tokens"],
                 "elapsed_s": round(elapsed, 3),
+                "effort": args.effort,
                 "tool": tool_uses[0],
             },
             ensure_ascii=False,

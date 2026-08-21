@@ -2,7 +2,7 @@
 
 两台 DGX Spark 通过双路 RoCE 互联运行 DeepSeek V4 Flash（1M context，TP=2 跨节点）。
 
-> 默认使用 padded `nvfp4_ds_mla` KV、`MAX_NUM_SEQS=6`、同步调度和单用户满窗 Prefill 档（16K batch / threshold 0 / memory 0.835），以及只安装 Issue #22 的本地稳定薄层镜像。该镜像同时修复长历史编码和 DSML 工具协议漂移。机器专属值写入被 Git 忽略的 `config.local.sh`。修复原理和回归方法见 [STABILITY.md](STABILITY.md)，实测 A/B 见 [BENCHMARK-20260819.md](BENCHMARK-20260819.md)。
+> 默认使用 padded `nvfp4_ds_mla` KV、`MAX_NUM_SEQS=6`、同步调度和单用户满窗 Prefill 档（16K batch / threshold 0 / memory 0.835）。稳定薄层固定 vLLM 基线并安装经过逐项验证的 thinking 协议、tokenizer、DSML、长参数流、工具名白名单和 mHC warmup 修复，同时只保留 MiaAI Issue #22 的 NVFP4 内核路由。原生 `/v1/messages` 可直接供 Claude Code 使用，不需要 UniClaudeProxy；OpenAI Chat/Responses 的标准 reasoning effort 也保留。机器专属值写入被 Git 忽略的 `config.local.sh`。修复原理见 [STABILITY.md](STABILITY.md)，整体补丁审查见 [stable-runtime/PATCH_REVIEW.md](stable-runtime/PATCH_REVIEW.md)，实测 A/B 见 [BENCHMARK-20260819.md](BENCHMARK-20260819.md)。
 
 ---
 
@@ -78,9 +78,8 @@ bash prepare.sh --all worker    # Worker
 # 当前用户必须能访问 Docker；若不能，先执行下列命令并重新登录
 sudo usermod -aG docker "$USER"
 
-docker pull ghcr.nju.edu.cn/anemll/dspark-vllm-gx10:0.1.1
-BASE_IMAGE=ghcr.nju.edu.cn/anemll/dspark-vllm-gx10:0.1.1 \
-  IMAGE=deepseek-v4-flash:0.1.1-stable-nvfp4-20260819 \
+# build.sh 会按 digest 拉取固定基础镜像，不要改回可漂移的 :0.1.1 tag
+IMAGE=deepseek-v4-flash:0.1.9-stable-20260821 \
   ./stable-runtime/build.sh
 ```
 
@@ -106,7 +105,7 @@ cp config.local.example.sh config.local.sh
 不要把管理网地址、SSH 用户、私有镜像凭据或个人目录写入已跟踪的 `config.sh`。公开默认值位于 `config.sh`：
 
 ```bash
-IMAGE="deepseek-v4-flash:0.1.1-stable-nvfp4-20260819"
+IMAGE="deepseek-v4-flash:0.1.9-stable-20260821"
 MODEL_PATH="/data/models/deepseek-ai/DeepSeek-V4-Flash-0731"
 HEAD_IP="10.10.12.11"
 WORKER_IP="10.10.12.21"
@@ -231,6 +230,21 @@ curl -s "${ANTHROPIC_BASE_URL}/v1/messages" \
   }' | python3 -m json.tool
 ```
 
+Thinking 参数应按协议原生字段设置：
+
+| 协议 | 推荐字段 |
+| --- | --- |
+| Anthropic `/v1/messages` | `"thinking":{"type":"adaptive"}` + `"output_config":{"effort":"max"}` |
+| OpenAI `/v1/chat/completions` | `"reasoning_effort":"max"` |
+| OpenAI `/v1/responses` | `"reasoning":{"effort":"max"}` |
+
+Anthropic `budget_tokens` 和 vLLM 的 OpenAI Chat 扩展
+`thinking_token_budget` 会由补丁后的 V2 sampler 精确执行。小于 `1024` 的预算
+容易在推理中途强制切换，除非是在测试截断，否则不建议使用。OpenAI Responses
+没有对应的标准 reasoning-only 数值预算；`max_output_tokens` 是 reasoning 与可见
+输出共用的总上限。可运行 `stable-runtime/probes/thinking_compat.py` 同时检查三条
+API 的非流式、流式、usage 和工具调用路径。
+
 #### ⑥ 吞吐基准
 
 ```bash
@@ -272,7 +286,7 @@ docker logs vllm_anemll 2>&1 | grep -E "NCCL.*rank.*nranks"
 deploy/
 ├── config.sh                    # 可公开默认值
 ├── config.local.example.sh      # 机器专属覆盖模板
-├── stable-runtime/              # PR #50686 可复现薄层镜像
+├── stable-runtime/              # 原生 Anthropic tokenizer/DSML/mHC 可复现薄层
 ├── stability-probe.py           # 多轮/长上下文回归探针
 ├── STABILITY.md                 # 根因、验证与回滚
 ├── prepare.sh         # 环境准备脚本 (交互式菜单)
@@ -307,13 +321,13 @@ docker exec vllm_anemll nvidia-smi
 
 模型 `config.json` 中 `max_position_embeddings: 1048576`，通过 **YaRN**（factor=16）从 65536 扩展到 1M，无需滑动窗口或外推技巧。对应启动参数 `--max-model-len 1048576`。
 
-2026-08-20 原生 Anthropic 满窗验证实际输入 `1,039,984` tokens：冷 Prefill `1,050.138s`（约 990 tok/s）；追加轮输入 `1,039,996` tokens，命中 `1,039,872`、只重算 124，Prefix Cache 命中率 `99.9881%`，服务端 TTFT `2.759s`、总耗时 `2.998s`。这证明容量和缓存都正常，但第一次灌入 1M KV 仍是十几分钟级。
+2026-08-21 在整体审查后的 `0.1.9` 上，原生 Anthropic 满窗/compact 验证实际输入 `1,040,105` tokens（窗口的 99.1921%），冷请求总耗时 `1,127.003s`（约 923 input tok/s）。同一历史的 compact 请求输入 `1,040,118` tokens，命中 `1,039,872`、只重算 246，Prefix Cache 命中率 `99.976349%`，总耗时 `11.293s`；替换为摘要后的 658-token 请求在 `5.579s` 完成结构化工具调用，四个埋点全部保留。这证明容量、缓存、compact 交接和工具路径都正常，但第一次灌入 1M KV 仍是十几分钟级。
 
 Prefix Cache 不会省掉客户端上传：无状态 OpenAI/Anthropic 客户端每轮仍发送完整历史。如果 Tailscale/覆盖网络退回 DERP 或其他中继，长请求可能主要卡在上传；应分别比较客户端 wall time 与 vLLM 的 TTFT/e2e 指标。
 
 ### 显存管理 — 单用户满窗档 0.835
 
-`--gpu-memory-utilization 0.835` 是 vLLM 建立执行与 KV cache 预算时使用的上限，不等于容器 RSS，也不能简单用“总内存减权重”推导安全并发。它与 16K prefill batch 配套：0.78 + 16K 只剩 8.22 GiB KV，低于 1M 所需的 10.91 GiB；0.835 + 16K 启动时可用 KV 为 15.33 GiB，并已完成 `1,039,984`-token 请求。
+`--gpu-memory-utilization 0.835` 是 vLLM 建立执行与 KV cache 预算时使用的上限，不等于容器 RSS，也不能简单用“总内存减权重”推导安全并发。它与 16K prefill batch 配套：0.78 + 16K 只剩 8.22 GiB KV，低于 1M 所需的 10.91 GiB；0.835 + 16K 已在 `0.1.9` 启动时提供 15.86 GiB、1,587,493-token KV cache，并完成 `1,040,105`-token 请求。
 
 | 值 | 效果 |
 |------|------|
@@ -337,7 +351,7 @@ tracked 默认值优化的是一条活跃满窗请求。一个人同时启动多
 | `--max-num-seqs` | `6` | 最多 6 条活跃序列；不等于 6 × 1M KV 容量 |
 | `--max-num-batched-tokens` | `16384` | 单用户冷 Prefill 实测档 |
 | `--long-prefill-token-threshold` | `0` | 允许唯一活跃 Prefill 吃满 batch |
-| `--kv-cache-dtype` | `nvfp4_ds_mla` | padded DSv4 布局；稳定镜像只应用 Issue #22 路由修复 |
+| `--kv-cache-dtype` | `nvfp4_ds_mla` | padded DSv4 布局；NVFP4 部分只应用 Issue #22 路由修复 |
 | `--block-size` | `256` | KV Cache block 大小 |
 | `--enable-chunked-prefill` | ✅ | 长 prompt 分块防 OOM |
 | `--enable-prefix-caching` | ✅ | 共享前缀复用 |

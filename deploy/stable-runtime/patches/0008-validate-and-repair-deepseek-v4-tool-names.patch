@@ -1,0 +1,88 @@
+# Local hardening found by the native Anthropic compaction gate. A declared
+# tool name may be prefixed by a truncated DSML outer marker; repair only that
+# exact, allow-listed suffix and suppress every other undeclared name.
+diff --git a/vllm/parser/deepseek_v4.py b/vllm/parser/deepseek_v4.py
+index 78b850dd..81b47a1b 100644
+--- a/vllm/parser/deepseek_v4.py
++++ b/vllm/parser/deepseek_v4.py
+@@ -35,6 +35,8 @@ from vllm.parser.engine.parser_engine_config import (
+ from vllm.tool_parsers.utils import find_tool_name, find_tool_properties
+ 
+ if TYPE_CHECKING:
++    from vllm.entrypoints.openai.engine.protocol import DeltaToolCall
++    from vllm.parser.engine.events import SemanticEvent
+     from vllm.tokenizers import TokenizerLike
+     from vllm.tool_parsers.abstract_tool_parser import Tool
+ 
+@@ -292,6 +294,7 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+         arg_converter=_dsml_arg_converter,
+         strip_content_whitespace_with_tools=False,
+         tool_args_json=False,
++        validate_tool_names=True,
+         malformed_tool_prefixes=(
+             DSML_TOOL_START,
+             DSML_INVOKE_PREFIX,
+@@ -381,6 +384,63 @@ class DeepSeekV4Parser(ParserEngine):
+             and find_tool_name(self._recovery_request_tools, name)
+         )
+ 
++    def _repair_contaminated_tool_name(self, raw_name: str | None) -> str | None:
++        """Recover a declared name after a truncated DSML marker.
++
++        DeepSeek occasionally emits a strict prefix of the outer tool marker
++        inside the subsequent ``invoke name`` value. Repair only when removing
++        one or more such prefixes yields an exactly declared request tool. Any
++        other malformed or undeclared name remains invalid and is suppressed
++        by ``validate_tool_names``.
++        """
++        if not raw_name:
++            return raw_name
++        candidate = raw_name.strip()
++        if find_tool_name(self._tools, candidate):
++            return candidate
++
++        for _ in range(4):
++            repaired = None
++            for marker in self.parser_engine_config.malformed_tool_prefixes:
++                max_prefix = min(len(marker), len(candidate))
++                for prefix_len in range(max_prefix, 0, -1):
++                    if candidate.startswith(marker[:prefix_len]):
++                        repaired = candidate[prefix_len:].lstrip()
++                        break
++                if repaired is not None:
++                    break
++            if not repaired or repaired == candidate:
++                break
++            candidate = repaired
++            if find_tool_name(self._tools, candidate):
++                return candidate
++        return raw_name
++
++    def _emit_name_delta(
++        self,
++        idx: int,
++        deltas: list[DeltaToolCall],
++        name: str | None,
++    ) -> None:
++        super()._emit_name_delta(
++            idx,
++            deltas,
++            self._repair_contaminated_tool_name(name),
++        )
++
++    def _handle_tool_end(
++        self,
++        event: SemanticEvent,
++        deltas: list[DeltaToolCall],
++    ) -> None:
++        idx = event.tool_index
++        if idx < len(self._tool_slots) and not self._tool_slots[idx].name_sent:
++            slot = self._tool_slots[idx]
++            repaired = self._repair_contaminated_tool_name(slot.name)
++            if repaired is not None:
++                slot.name = repaired
++        super()._handle_tool_end(event, deltas)
++
+     def _convert_args(self, raw_args: str, partial: bool) -> str:
+         result = _dsml_arg_converter(raw_args, partial)
+         if not self._tools:

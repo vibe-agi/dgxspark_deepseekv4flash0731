@@ -1,0 +1,187 @@
+# Local hardening found by the native Anthropic lifecycle and patch-quality
+# review. Generalize malformed marker handling, bound provisional recovery,
+# clear stale recovery state, and keep ordinary markup on the linear arg path.
+diff --git a/vllm/parser/deepseek_v4.py b/vllm/parser/deepseek_v4.py
+index 8b950fc2..78b850dd 100644
+--- a/vllm/parser/deepseek_v4.py
++++ b/vllm/parser/deepseek_v4.py
+@@ -293,8 +293,10 @@ def deepseek_v4_config(thinking: bool = False) -> ParserEngineConfig:
+         strip_content_whitespace_with_tools=False,
+         tool_args_json=False,
+         malformed_tool_prefixes=(
+-            f"<{_DSML}tool_",
+-            f"<{_DSML_ASCII}tool_",
++            DSML_TOOL_START,
++            DSML_INVOKE_PREFIX,
++            DSML_TOOL_START_ASCII,
++            DSML_INVOKE_PREFIX_ASCII,
+         ),
+     )
+ 
+@@ -395,7 +397,7 @@ class DeepSeekV4Parser(ParserEngine):
+         if (
+             slot.active_string_param is not None
+             and slot.in_open_string
+-            and "<" not in raw_delta
++            and not _has_pending_tag(raw_delta)
+         ):
+             escaped_delta = json.dumps(raw_delta, ensure_ascii=False)[1:-1]
+             slot.streamed_json += escaped_delta
+diff --git a/vllm/parser/engine/parser_engine_config.py b/vllm/parser/engine/parser_engine_config.py
+index eeb0831d..b4cba4d7 100644
+--- a/vllm/parser/engine/parser_engine_config.py
++++ b/vllm/parser/engine/parser_engine_config.py
+@@ -100,9 +100,10 @@ class ParserEngineConfig:
+     # Reject tool calls whose names are absent from the request tools.
+     validate_tool_names: bool = False
+ 
+-    # Prefixes used to identify a truncated outer tool wrapper. Matching text
+-    # is held briefly and discarded only when a real tool transition follows;
+-    # otherwise it is emitted unchanged.
++    # Complete outer-wrapper markers whose strict prefixes may be emitted as
++    # malformed content. A matching fragment is held briefly and discarded
++    # only when a real tool transition follows; otherwise it is emitted
++    # unchanged.
+     malformed_tool_prefixes: tuple[str, ...] = field(default_factory=tuple)
+ 
+     @cached_property
+diff --git a/vllm/parser/engine/streaming_parser_engine.py b/vllm/parser/engine/streaming_parser_engine.py
+index 8a49e7f7..65955d45 100644
+--- a/vllm/parser/engine/streaming_parser_engine.py
++++ b/vllm/parser/engine/streaming_parser_engine.py
+@@ -30,6 +30,10 @@ from vllm.parser.engine.token_id_scanner import (
+ )
+ 
+ 
++_MAX_MALFORMED_TOOL_PREFIX_CHARS = 4096
++_MAX_RECOVERY_HOLD_CHARS = 8 * 1024 * 1024
++
++
+ @dataclass(slots=True)
+ class _DropInfo:
+     lexer_shape: LexerShape
+@@ -194,7 +198,8 @@ class StreamingParserEngine:
+         self._reset_args_state()
+         self._recovery_hold_active = False
+         self._recovery_hold_events: list[SemanticEvent] = []
+-        self._recovery_hold_raw = ""
++        self._recovery_hold_raw_parts: list[str] = []
++        self._recovery_hold_raw_chars = 0
+         self._recovery_hold_name = ""
+         self._recovery_prior_state = self.state
+         self._recovery_prior_tool_index = -1
+@@ -385,25 +390,44 @@ class StreamingParserEngine:
+     def _emit_for_state(self, text: str) -> list[SemanticEvent]:
+         if self._recovery_hold_active:
+             return self._hold_recovery_text(text)
+-        prefixes = self.config.malformed_tool_prefixes
++        if (
++            self._recovery_outer_closer_pending
++            and self.state == ParserState.CONTENT
++            and text.strip()
++        ):
++            # A recovered invoke may still be followed by its missing outer
++            # close, but only immediately (ignoring whitespace). Do not let a
++            # stale recovery flag eat a later literal close after prose.
++            self._recovery_outer_closer_pending = False
+         if self._malformed_tool_prefix_buffer:
+-            if not text.strip():
+-                self._malformed_tool_prefix_buffer += text
++            combined = self._malformed_tool_prefix_buffer + text
++            if (
++                len(combined) <= _MAX_MALFORMED_TOOL_PREFIX_CHARS
++                and self._is_malformed_tool_prefix(combined)
++            ):
++                self._malformed_tool_prefix_buffer = combined
+                 return []
+             events = self._flush_malformed_tool_prefix()
+-            events.extend(self._emit_for_state_now(text))
++            events.extend(self._emit_for_state(text))
+             return events
+-        stripped = text.strip()
+         if (
+-            prefixes
+-            and stripped
+-            and ">" not in stripped
+-            and any(stripped.startswith(prefix) for prefix in prefixes)
++            len(text) <= _MAX_MALFORMED_TOOL_PREFIX_CHARS
++            and self._is_malformed_tool_prefix(text)
+         ):
+             self._malformed_tool_prefix_buffer = text
+             return []
+         return self._emit_for_state_now(text)
+ 
++    def _is_malformed_tool_prefix(self, text: str) -> bool:
++        stripped = text.strip()
++        return bool(
++            stripped
++            and any(
++                marker.startswith(stripped)
++                for marker in self.config.malformed_tool_prefixes
++            )
++        )
++
+     def _emit_for_state_now(self, text: str) -> list[SemanticEvent]:
+         if self.state == ParserState.TOOL_ARGS:
+             if self.config.tool_args_json:
+@@ -421,7 +445,8 @@ class StreamingParserEngine:
+         return []
+ 
+     def _hold_recovery_text(self, text: str) -> list[SemanticEvent]:
+-        self._recovery_hold_raw += text
++        if not self._append_recovery_raw(text):
++            return self._abort_recovery_hold()
+         if self.state == ParserState.TOOL_NAME:
+             self._recovery_hold_name += text
+             if len(self._recovery_hold_name) > 256 or "\n" in self._recovery_hold_name:
+@@ -429,6 +454,11 @@ class StreamingParserEngine:
+         self._recovery_hold_events.extend(self._emit_for_state_now(text))
+         return []
+ 
++    def _append_recovery_raw(self, text: str) -> bool:
++        self._recovery_hold_raw_parts.append(text)
++        self._recovery_hold_raw_chars += len(text)
++        return self._recovery_hold_raw_chars <= _MAX_RECOVERY_HOLD_CHARS
++
+     def _flush_malformed_tool_prefix(self) -> list[SemanticEvent]:
+         text = self._malformed_tool_prefix_buffer
+         self._malformed_tool_prefix_buffer = ""
+@@ -474,7 +504,8 @@ class StreamingParserEngine:
+         held_events = self._run_transition(transition, value)
+         self._recovery_hold_active = True
+         self._recovery_hold_events = held_events
+-        self._recovery_hold_raw = value
++        self._recovery_hold_raw_parts = [value]
++        self._recovery_hold_raw_chars = len(value)
+         self._recovery_hold_name = ""
+         self._recovery_prior_state = prior_state
+         self._recovery_prior_tool_index = prior_tool_index
+@@ -485,7 +516,8 @@ class StreamingParserEngine:
+         transition: Transition,
+         value: str,
+     ) -> list[SemanticEvent]:
+-        self._recovery_hold_raw += value
++        if not self._append_recovery_raw(value):
++            return self._abort_recovery_hold()
+ 
+         if self.state == ParserState.TOOL_NAME:
+             validator = self.recovery_tool_name_validator
+@@ -507,7 +539,7 @@ class StreamingParserEngine:
+         return self._abort_recovery_hold()
+ 
+     def _abort_recovery_hold(self) -> list[SemanticEvent]:
+-        raw = self._recovery_hold_raw
++        raw = "".join(self._recovery_hold_raw_parts)
+         self.state = self._recovery_prior_state
+         self.tool_index = self._recovery_prior_tool_index
+         self._reset_args_state()
+@@ -517,7 +549,8 @@ class StreamingParserEngine:
+     def _clear_recovery_hold(self) -> None:
+         self._recovery_hold_active = False
+         self._recovery_hold_events = []
+-        self._recovery_hold_raw = ""
++        self._recovery_hold_raw_parts = []
++        self._recovery_hold_raw_chars = 0
+         self._recovery_hold_name = ""
+ 
+     def _run_transition(

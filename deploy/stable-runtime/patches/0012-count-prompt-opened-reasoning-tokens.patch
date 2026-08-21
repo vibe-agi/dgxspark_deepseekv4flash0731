@@ -1,0 +1,30 @@
+# Local bounded fix for prompt-opened reasoning spans in the Responses API.
+# Related upstream reports and proposed fixes:
+# https://github.com/vllm-project/vllm/issues/49711
+# https://github.com/vllm-project/vllm/pull/49743
+#
+# DeepSeek V4's chat template opens <think> in the prompt.  The generated
+# suffix therefore contains reasoning tokens and </think>, but no generated
+# <think>. Seed the counter from ParserEngineConfig.initial_state only when the
+# generated suffix has no start token. This also matches the marker-presence
+# rule proposed upstream and avoids double-opening a repeated generated start.
+diff --git a/vllm/parser/engine/parser_engine.py b/vllm/parser/engine/parser_engine.py
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -636,7 +636,15 @@ class ParserEngine:
+         if start_id is None or end_id is None:
+             return 0
+         count = 0
+-        depth = 0
++        # Some chat templates open the reasoning span in the prompt, so the
++        # generated suffix starts with reasoning content and contains only the
++        # closing marker. Seed that virtual span only when the suffix does not
++        # contain its own start marker; otherwise the loop opens it normally
++        # and a repeated marker cannot double-count the visible answer.
++        depth = int(
++            self.parser_engine_config.initial_state == ParserState.REASONING
++            and start_id not in token_ids
++        )
+         for token_id in token_ids:
+             if token_id == start_id:
+                 depth += 1

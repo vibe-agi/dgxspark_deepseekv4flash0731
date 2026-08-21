@@ -2,6 +2,8 @@
 # Copy to config.local.sh on both nodes and edit locally.
 # config.local.sh is ignored by Git. Keep hostnames, management IPs, mount paths,
 # registry credentials, and other machine-specific values there.
+# Do not pin IMAGE here unless this node intentionally tracks a private tag.
+# A local IMAGE override wins over future tracked defaults in config.sh.
 
 MODEL_PATH="${MODEL_PATH:-/data/models/deepseek-ai/DeepSeek-V4-Flash-0731}"
 

@@ -1,0 +1,70 @@
+# Local hardening found by whole-series complexity review. The long-string
+# fast path must not re-copy the complete emitted JSON prefix for every model
+# delta; defer those fragments and materialize them once at a structural edge.
+diff --git a/vllm/parser/engine/parser_engine.py b/vllm/parser/engine/parser_engine.py
+--- a/vllm/parser/engine/parser_engine.py
++++ b/vllm/parser/engine/parser_engine.py
+@@ -54,6 +54,7 @@ class ToolCallSlot:
+         "name_sent",
+         "string_keys",
+         "streamed_json",
++        "streamed_json_parts",
+         "active_string_param",
+         "in_open_string",
+     )
+@@ -66,6 +67,7 @@ class ToolCallSlot:
+         self.name_sent: bool = False
+         self.string_keys: set[str] | None = None
+         self.streamed_json: str = ""
++        self.streamed_json_parts: list[str] | None = None
+         self.active_string_param: str | None = None
+         self.in_open_string: bool = False
+ 
+@@ -79,6 +81,19 @@ class ToolCallSlot:
+         self._args_parts.append(value)
+         self._args_joined = None
+ 
++    def append_streamed_json(self, value: str) -> None:
++        """Append an emitted JSON delta without repeatedly copying its prefix."""
++        if self.streamed_json_parts is None:
++            self.streamed_json_parts = [self.streamed_json]
++        self.streamed_json_parts.append(value)
++
++    def materialize_streamed_json(self) -> str:
++        """Join deferred JSON deltas once before a full-prefix comparison."""
++        if self.streamed_json_parts is not None:
++            self.streamed_json = "".join(self.streamed_json_parts)
++            self.streamed_json_parts = None
++        return self.streamed_json
++
+ 
+ class ParserEngine(Parser):
+     """A :class:`Parser` backed by a single declarative engine config.
+diff --git a/vllm/parser/deepseek_v4.py b/vllm/parser/deepseek_v4.py
+--- a/vllm/parser/deepseek_v4.py
++++ b/vllm/parser/deepseek_v4.py
+@@ -460,9 +460,12 @@ class DeepSeekV4Parser(ParserEngine):
+             and not _has_pending_tag(raw_delta)
+         ):
+             escaped_delta = json.dumps(raw_delta, ensure_ascii=False)[1:-1]
+-            slot.streamed_json += escaped_delta
++            slot.append_streamed_json(escaped_delta)
+             return escaped_delta
+ 
++        # The generic converter compares complete JSON prefixes. Materialize
++        # deferred fast-path fragments once before handing control back.
++        slot.materialize_streamed_json()
+         diff = super()._compute_arg_delta(idx, raw_delta)
+ 
+         last_end = 0
+@@ -490,6 +493,8 @@ class DeepSeekV4Parser(ParserEngine):
+ 
+     def _flush_arg_converter(self, idx: int) -> str | None:
+         if idx < len(self._tool_slots):
+-            self._tool_slots[idx].active_string_param = None
+-            self._tool_slots[idx].in_open_string = False
++            slot = self._tool_slots[idx]
++            slot.materialize_streamed_json()
++            slot.active_string_param = None
++            slot.in_open_string = False
+         return super()._flush_arg_converter(idx)
